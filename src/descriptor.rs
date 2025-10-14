@@ -1,16 +1,25 @@
 #![allow(dead_code)]
 #![allow(unused_must_use)]
 #![allow(unused)]
+use crate::Deleter;
+use crate::DropBox;
+use crate::DropPointer;
 use crate::HazPtrHolder;
+use crate::HazPtrObject;
 use crate::Retired;
+use std::ops::DerefMut;
 use std::sync::atomic::Ordering;
 use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicUsize};
+
+static DELETER1: DropBox = DropBox::new();
+static DELETER2: DropPointer = DropPointer::new();
 
 pub struct Descriptor<T> {
     ptr: AtomicPtr<T>,
     next: *mut T,
     status: AtomicUsize,
     pending: AtomicBool,
+    creator: &'static dyn Deleter,
 }
 
 pub struct RawDescriptor<T> {
@@ -24,45 +33,43 @@ impl<T> Descriptor<T> {
             next,
             status: AtomicUsize::new(0),
             pending: AtomicBool::new(true),
+            creator: &DELETER1,
         }
     }
 }
 
 impl<T> RawDescriptor<T> {
     pub fn new() -> Self {
-        let descriptor = Box::into_raw(Box::new(Descriptor {
-            ptr: AtomicPtr::new(std::ptr::null_mut()),
-            next: std::ptr::null_mut(),
-            status: AtomicUsize::new(1),
-            pending: AtomicBool::new(false),
-        }));
         Self {
-            descriptor: AtomicPtr::new(descriptor),
+            descriptor: AtomicPtr::new(std::ptr::null_mut()),
         }
     }
 
     pub fn try_or_help(&self, ptr: AtomicPtr<T>, next: *mut T) {
         let new = Box::into_raw(Box::new(Descriptor::new(ptr, next)));
+        let mut holder = HazPtrHolder::default();
         loop {
-            match unsafe {
-                (*(&self.descriptor).load(Ordering::Relaxed)) // Hazptpr inclusion
-                    .pending
-                    .compare_exchange(false, true, Ordering::Relaxed, Ordering::Relaxed)
-            } {
-                Ok(_) => {
-                    self.descriptor.store(new, Ordering::Relaxed);
-                    // Hazptr inclusion to be done...the old one will be retired here
+            let mut guard = unsafe { holder.load(&self.descriptor) };
+            if guard.is_none() {
+                if self
+                    .descriptor
+                    .compare_exchange(
+                        std::ptr::null_mut(),
+                        new,
+                        Ordering::Relaxed,
+                        Ordering::Relaxed,
+                    )
+                    .is_ok()
+                {
                     match unsafe { (&(*new).status).load(Ordering::Relaxed) } {
                         0 => unsafe {
                             (&(*new).ptr).store(next, Ordering::Release);
-
                             (&(*new).status).compare_exchange(
                                 0,
                                 1,
                                 Ordering::Relaxed,
                                 Ordering::Relaxed,
                             );
-
                             (&(*new).pending).compare_exchange(
                                 true,
                                 false,
@@ -80,38 +87,82 @@ impl<T> RawDescriptor<T> {
                         },
                         _ => panic!(),
                     }
-                }
-
-                Err(_) => {
-                    let current = self.descriptor.load(Ordering::Acquire); //HazPtr to be used
-
-                    unsafe {
-                        match (&(*current).status).load(Ordering::Relaxed) {
-                            0 => {
-                                (&(*current).ptr).store(next, Ordering::Release);
-                                // Hazptr to be used...old one will be retired here
-                                (&(*current).status).compare_exchange(
-                                    0,
-                                    1,
-                                    Ordering::Relaxed,
-                                    Ordering::Relaxed,
-                                );
-                                (&(*current).pending).compare_exchange(
-                                    true,
-                                    false,
-                                    Ordering::Relaxed,
-                                    Ordering::Relaxed,
-                                );
+                } else {
+                    match unsafe {
+                        (*(guard.expect("Has to be there").deref_mut() as *mut Descriptor<T>))
+                            .pending
+                            .compare_exchange(false, true, Ordering::Relaxed, Ordering::Relaxed)
+                    } {
+                        Ok(_) => {
+                            let deleter =
+                                unsafe { (*(&self.descriptor).load(Ordering::Acquire)).creator };
+                            let mut wrapper =
+                                unsafe { holder.swap(&self.descriptor, new, deleter) };
+                            if let Some(mut object) = wrapper {
+                                object.retire();
                             }
-                            1 => {
-                                (&(*current).pending).compare_exchange(
-                                    true,
-                                    false,
-                                    Ordering::Relaxed,
-                                    Ordering::Relaxed,
-                                );
+                            match unsafe { (&(*new).status).load(Ordering::Relaxed) } {
+                                0 => unsafe {
+                                    (&(*new).ptr).store(next, Ordering::Release);
+
+                                    (&(*new).status).compare_exchange(
+                                        0,
+                                        1,
+                                        Ordering::Relaxed,
+                                        Ordering::Relaxed,
+                                    );
+
+                                    (&(*new).pending).compare_exchange(
+                                        true,
+                                        false,
+                                        Ordering::Relaxed,
+                                        Ordering::Relaxed,
+                                    );
+                                },
+                                1 => unsafe {
+                                    (&(*new).pending).compare_exchange(
+                                        true,
+                                        false,
+                                        Ordering::Relaxed,
+                                        Ordering::Relaxed,
+                                    );
+                                },
+                                _ => panic!(),
                             }
-                            _ => panic!(),
+                        }
+
+                        Err(_) => {
+                            let current = self.descriptor.load(Ordering::Acquire); //HazPtr to be used
+
+                            unsafe {
+                                match (&(*current).status).load(Ordering::Relaxed) {
+                                    0 => {
+                                        (&(*current).ptr).store(next, Ordering::Release);
+                                        // Hazptr to be used...old one will be retired here
+                                        (&(*current).status).compare_exchange(
+                                            0,
+                                            1,
+                                            Ordering::Relaxed,
+                                            Ordering::Relaxed,
+                                        );
+                                        (&(*current).pending).compare_exchange(
+                                            true,
+                                            false,
+                                            Ordering::Relaxed,
+                                            Ordering::Relaxed,
+                                        );
+                                    }
+                                    1 => {
+                                        (&(*current).pending).compare_exchange(
+                                            true,
+                                            false,
+                                            Ordering::Relaxed,
+                                            Ordering::Relaxed,
+                                        );
+                                    }
+                                    _ => panic!(),
+                                }
+                            }
                         }
                     }
                 }

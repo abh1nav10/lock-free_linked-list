@@ -103,12 +103,16 @@ impl HazPtrHolder {
     ) -> Option<HazPtrObjectWrapper<'_, T>> {
         let current = atomic.load(Ordering::SeqCst);
         atomic.store(ptr, Ordering::SeqCst);
-        let wrapper = HazPtrObjectWrapper {
-            inner: current,
-            domain: &SHARED_DOMAIN,
-            deleter: deleter,
-        };
-        return Some(wrapper);
+        if current.is_null() {
+            return None;
+        } else {
+            let wrapper = HazPtrObjectWrapper {
+                inner: current,
+                domain: &SHARED_DOMAIN,
+                deleter: deleter,
+            };
+            return Some(wrapper);
+        }
     }
 
     ///SAFETY:
@@ -122,12 +126,16 @@ impl HazPtrHolder {
     ) -> Option<HazPtrObjectWrapper<'_, T>> {
         let current = atomic.load(Ordering::SeqCst);
         atomic.store(std::ptr::null_mut(), Ordering::SeqCst);
-        let wrapper = HazPtrObjectWrapper {
-            inner: current,
-            domain: &SHARED_DOMAIN,
-            deleter: deleter,
-        };
-        return Some(wrapper);
+        if current.is_null() {
+            return None;
+        } else {
+            let wrapper = HazPtrObjectWrapper {
+                inner: current,
+                domain: &SHARED_DOMAIN,
+                deleter: deleter,
+            };
+            return Some(wrapper);
+        }
     }
 }
 
@@ -323,7 +331,7 @@ pub(crate) struct Ret {
     deleter: &'static dyn Deleter,
 }
 
-pub(crate) trait Deleter {
+pub trait Deleter {
     fn delete(&self, ptr: *mut dyn Uniform);
 }
 
@@ -336,7 +344,7 @@ pub(crate) trait Deleter {
 ///      lifetime because we never know when the delete method on that deleter will be called.
 ///      Using static does not come with any memory overhead as the underlying type would be a zero
 ///      sized type.
-pub(crate) struct DropBox;
+pub struct DropBox;
 
 impl DropBox {
     pub const fn new() -> Self {
@@ -353,7 +361,7 @@ impl Deleter for DropBox {
     }
 }
 
-pub(crate) struct DropPointer;
+pub struct DropPointer;
 
 impl DropPointer {
     pub const fn new() -> Self {
@@ -398,7 +406,19 @@ impl Retired {
             } else {
                 let next = unsafe { ((*now).next).load(Ordering::SeqCst) };
                 unsafe { (*now).next.store(remaining, Ordering::SeqCst) };
-                remaining = now;
+                if remaining.is_null() {
+                    remaining = now;
+                    unsafe {
+                        (*remaining)
+                            .next
+                            .store(std::ptr::null_mut(), Ordering::SeqCst);
+                    }
+                } else {
+                    unsafe {
+                        (*now).next.store(remaining, Ordering::SeqCst);
+                    }
+                    remaining = now;
+                }
                 now = next;
             }
         }
