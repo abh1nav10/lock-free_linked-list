@@ -161,7 +161,7 @@ pub(crate) trait HazPtrObject {
     fn retire(&mut self);
 }
 
-pub(crate) struct HazPtrObjectWrapper<'a, T> {
+pub struct HazPtrObjectWrapper<'a, T> {
     inner: *mut T,
     domain: &'a HazPtrDomain,
     deleter: &'static dyn Deleter,
@@ -326,7 +326,7 @@ pub struct Retired {
     head: AtomicPtr<Ret>,
 }
 
-pub(crate) trait Uniform {}
+pub trait Uniform {}
 
 impl<T> Uniform for T {}
 

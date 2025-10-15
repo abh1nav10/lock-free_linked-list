@@ -14,7 +14,7 @@ use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicUsize};
 static DELETER1: DropBox = DropBox::new();
 static DELETER2: DropPointer = DropPointer::new();
 
-pub struct Descriptor<'a, T> {
+pub(crate) struct Descriptor<'a, T> {
     ptr: &'a AtomicPtr<T>,
     next: *mut T,
     // 0: CAS on the ptr needs to be done
@@ -22,9 +22,27 @@ pub struct Descriptor<'a, T> {
     status: AtomicUsize,
     pending: AtomicBool,
     creator: &'static dyn Deleter,
+    // this field provides the caller with the freedom to specify what method
+    // of the Mile trait which T implements will be called
+    after: usize,
 }
 
-pub struct RawDescriptor<'a, T> {
+// The Mile trait provides the user with a way to perform some other operations
+// on the type T which is bounded by this trait after the swap has happened.
+// This is common in data structures like linked lists where nodes need to be updated
+// and provides a good way to update other things if any in a fully concurrent lock free manner;
+// For types that do not need such updates the default implementation of the trait
+// can safely be used.
+pub trait Mile {
+    fn first(ptr1: *mut Self, ptr2: *mut Self) {
+        return;
+    }
+    fn second(ptr1: *mut Self, ptr2: *mut Self) {
+        return;
+    }
+}
+
+pub(crate) struct RawDescriptor<'a, T> {
     descriptor: AtomicPtr<Descriptor<'a, T>>,
 }
 
@@ -47,35 +65,31 @@ impl<'a, T> Drop for RawDescriptor<'a, T> {
     }
 }
 
-pub trait Completer {
-    fn first<F>(&self, ptr: *mut F);
-    fn second<F>(&self, ptr: *mut F);
-}
-
 impl<'a, T> Descriptor<'a, T> {
-    pub fn new(ptr: &'a AtomicPtr<T>, next: *mut T) -> Self {
+    pub fn new(ptr: &'a AtomicPtr<T>, next: *mut T, after: usize) -> Self {
         Self {
             ptr,
             next,
             status: AtomicUsize::new(0),
             pending: AtomicBool::new(true),
             creator: &DELETER1,
+            after,
         }
     }
 }
 
-impl<'a, T> RawDescriptor<'a, T> {
+impl<'a, T> RawDescriptor<'a, T>
+where
+    T: Mile,
+{
     pub fn new() -> Self {
         Self {
             descriptor: AtomicPtr::new(std::ptr::null_mut()),
         }
     }
 
-    pub fn try_or_help<F>(&self, ptr: &'a AtomicPtr<T>, next: *mut T, ds: F)
-    where
-        F: Completer,
-    {
-        let new = Box::into_raw(Box::new(Descriptor::new(ptr, next)));
+    pub fn try_or_help(&self, ptr: &'a AtomicPtr<T>, next: *mut T, after: usize) {
+        let new = Box::into_raw(Box::new(Descriptor::new(ptr, next, after)));
         let mut holder = HazPtrHolder::default();
         loop {
             ///SAFETY:
@@ -102,7 +116,7 @@ impl<'a, T> RawDescriptor<'a, T> {
                         1 => unsafe {
                             (&(*new).pending).store(false, Ordering::Release);
                         },
-                        _ => panic!("Status field not initialized correctly"),
+                        _ => unreachable!(),
                     }
                     break;
                 } else {
@@ -127,6 +141,12 @@ impl<'a, T> RawDescriptor<'a, T> {
                             match unsafe { (&(*new).status).load(Ordering::Acquire) } {
                                 0 => unsafe {
                                     (&(*new).ptr).store(next, Ordering::Release);
+                                    let ptr2 = unsafe { (*current).ptr.load(Ordering::Acquire) };
+                                    if after == 1 {
+                                        Mile::first(next, ptr2);
+                                    } else {
+                                        Mile::second(next, ptr2);
+                                    }
                                     (&(*new).status).store(1, Ordering::Release);
 
                                     (&(*new).pending).store(false, Ordering::Release);
@@ -134,7 +154,7 @@ impl<'a, T> RawDescriptor<'a, T> {
                                 1 => unsafe {
                                     (&(*new).pending).store(false, Ordering::Release);
                                 },
-                                _ => panic!("Status field not initialized correctly"),
+                                _ => unreachable!(),
                             }
                             break;
                         }
@@ -144,13 +164,20 @@ impl<'a, T> RawDescriptor<'a, T> {
                             match (&(*current.deref_mut()).status).load(Ordering::Acquire) {
                                 0 => {
                                     (&(*current.deref_mut()).ptr).store(b, Ordering::Release);
+                                    let ptr2 = unsafe { (*current).ptr.load(Ordering::Acquire) };
+                                    let after = unsafe { (*current).after };
+                                    if after == 1 {
+                                        Mile::first(next, ptr2);
+                                    } else {
+                                        Mile::second(next, ptr2);
+                                    }
                                     (&(*current).status).store(1, Ordering::Release);
                                     (&(*current).pending).store(false, Ordering::Release);
                                 }
                                 1 => {
                                     (&(*current).pending).store(false, Ordering::Release);
                                 }
-                                _ => panic!("Status field not initialized correctly"),
+                                _ => unreachable!(),
                             }
                         }
                     }
