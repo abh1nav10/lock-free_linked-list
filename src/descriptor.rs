@@ -47,6 +47,11 @@ impl<'a, T> Drop for RawDescriptor<'a, T> {
     }
 }
 
+pub trait Completer {
+    fn first<F>(&self, ptr: *mut F);
+    fn second<F>(&self, ptr: *mut F);
+}
+
 impl<'a, T> Descriptor<'a, T> {
     pub fn new(ptr: &'a AtomicPtr<T>, next: *mut T) -> Self {
         Self {
@@ -66,10 +71,16 @@ impl<'a, T> RawDescriptor<'a, T> {
         }
     }
 
-    pub fn try_or_help(&self, ptr: &'a AtomicPtr<T>, next: *mut T) {
+    pub fn try_or_help<F>(&self, ptr: &'a AtomicPtr<T>, next: *mut T, ds: F)
+    where
+        F: Completer,
+    {
         let new = Box::into_raw(Box::new(Descriptor::new(ptr, next)));
         let mut holder = HazPtrHolder::default();
         loop {
+            ///SAFETY:
+            ///    Caller must ensure that the list does not get dropped before the call to
+            ///    this method completes
             let mut guard = unsafe { holder.load(&self.descriptor) };
             if guard.is_none() {
                 if self
@@ -85,106 +96,61 @@ impl<'a, T> RawDescriptor<'a, T> {
                     match unsafe { (&(*new).status).load(Ordering::Acquire) } {
                         0 => unsafe {
                             (&(*new).ptr).store(next, Ordering::Release);
-                            (&(*new).status).compare_exchange(
-                                0,
-                                1,
-                                Ordering::Relaxed,
-                                Ordering::Relaxed,
-                            );
-                            (&(*new).pending).compare_exchange(
-                                true,
-                                false,
-                                Ordering::AcqRel,
-                                Ordering::Relaxed,
-                            );
+                            (&(*new).status).store(1, Ordering::Release);
+                            (&(*new).pending).store(false, Ordering::Release);
                         },
                         1 => unsafe {
-                            (&(*new).pending).compare_exchange(
-                                true,
-                                false,
-                                Ordering::AcqRel,
-                                Ordering::Relaxed,
-                            );
+                            (&(*new).pending).store(false, Ordering::Release);
                         },
-                        _ => panic!(),
+                        _ => panic!("Status field not initialized correctly"),
                     }
                     break;
                 } else {
+                    let mut current = guard.expect("Has to be there");
                     match unsafe {
-                        (*(guard.expect("Has to be there").deref_mut() as *mut Descriptor<T>))
-                            .pending
-                            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Relaxed)
+                        (*(current.deref_mut())).pending.compare_exchange(
+                            false,
+                            true,
+                            Ordering::AcqRel,
+                            Ordering::Relaxed,
+                        )
                     } {
                         Ok(_) => {
                             let deleter =
                                 unsafe { (*(&self.descriptor).load(Ordering::Acquire)).creator };
+                            let mut temp_holder = HazPtrHolder::default();
                             let mut wrapper =
-                                unsafe { holder.swap(&self.descriptor, new, deleter) };
+                                unsafe { temp_holder.swap(&self.descriptor, new, deleter) };
                             if let Some(mut object) = wrapper {
                                 object.retire();
                             }
                             match unsafe { (&(*new).status).load(Ordering::Acquire) } {
                                 0 => unsafe {
                                     (&(*new).ptr).store(next, Ordering::Release);
+                                    (&(*new).status).store(1, Ordering::Release);
 
-                                    (&(*new).status).compare_exchange(
-                                        0,
-                                        1,
-                                        Ordering::AcqRel,
-                                        Ordering::Relaxed,
-                                    );
-
-                                    (&(*new).pending).compare_exchange(
-                                        true,
-                                        false,
-                                        Ordering::AcqRel,
-                                        Ordering::Relaxed,
-                                    );
+                                    (&(*new).pending).store(false, Ordering::Release);
                                 },
                                 1 => unsafe {
-                                    (&(*new).pending).compare_exchange(
-                                        true,
-                                        false,
-                                        Ordering::AcqRel,
-                                        Ordering::Relaxed,
-                                    );
+                                    (&(*new).pending).store(false, Ordering::Release);
                                 },
-                                _ => panic!(),
+                                _ => panic!("Status field not initialized correctly"),
                             }
                             break;
                         }
 
                         Err(_) => {
-                            let current = self.descriptor.load(Ordering::Acquire); //HazPtr to be used
-
-                            unsafe {
-                                match (&(*current).status).load(Ordering::Acquire) {
-                                    0 => {
-                                        (&(*current).ptr).store(next, Ordering::Release);
-                                        // Hazptr to be used...old one will be retired here
-                                        (&(*current).status).compare_exchange(
-                                            0,
-                                            1,
-                                            Ordering::AcqRel,
-                                            Ordering::Relaxed,
-                                        );
-                                        (&(*current).pending).compare_exchange(
-                                            true,
-                                            false,
-                                            Ordering::AcqRel,
-                                            Ordering::Relaxed,
-                                        );
-                                    }
-                                    1 => {
-                                        (&(*current).pending).compare_exchange(
-                                            true,
-                                            false,
-                                            Ordering::AcqRel,
-                                            Ordering::Relaxed,
-                                        );
-                                    }
-                                    _ => panic!(),
+                            let b = unsafe { (*current.deref_mut()).next };
+                            match (&(*current.deref_mut()).status).load(Ordering::Acquire) {
+                                0 => {
+                                    (&(*current.deref_mut()).ptr).store(b, Ordering::Release);
+                                    (&(*current).status).store(1, Ordering::Release);
+                                    (&(*current).pending).store(false, Ordering::Release);
                                 }
+                                1 => {
+                                    (&(*current).pending).store(false, Ordering::Release);
+                                }
+                                _ => panic!("Status field not initialized correctly"),
                             }
                         }
                     }

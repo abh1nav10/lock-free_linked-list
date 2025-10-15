@@ -8,3 +8,5 @@ pub use crate::hazard::DropPointer;
 pub use crate::hazard::HazPtrHolder;
 use crate::hazard::HazPtrObject;
 pub use crate::hazard::Retired;
+
+pub use crate::descriptor::Completer;

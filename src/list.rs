@@ -1,3 +1,4 @@
+use crate::Completer;
 #[allow(unused_imports)]
 use crate::HazPtrHolder;
 #[allow(unused_imports)]
@@ -6,6 +7,7 @@ use std::marker::PhantomData;
 use std::ops::DerefMut;
 use std::sync::atomic::Ordering;
 use std::sync::atomic::{AtomicPtr, AtomicUsize};
+
 pub struct Node<T> {
     #[allow(dead_code)]
     value: T,
@@ -33,6 +35,23 @@ pub struct LinkedList<T> {
 unsafe impl<T> Send for LinkedList<T> where T: Send {}
 unsafe impl<T> Sync for LinkedList<T> where T: Sync {}
 
+impl<T> Completer for LinkedList<T> {
+    fn first<F>(&self, ptr: *mut F) {
+        let head_ptr = self.head.load(Ordering::Acquire);
+        unsafe {
+            (*head_ptr).next.store(ptr, Ordering::Release);
+            (*ptr).prev.store(head_ptr, Ordering::Release);
+        }
+    }
+    fn second<F>(&self, ptr: *mut F) {
+        let tail_ptr = self.tail.load(Ordering::Acquire);
+        unsafe {
+            (*tail_ptr).prev.store(ptr, Ordering::Release);
+            (*ptr).next.store(tail_ptr, Ordering::Release);
+        }
+    }
+}
+
 impl<T> LinkedList<T> {
     pub fn new() -> Self {
         Self {
@@ -52,14 +71,14 @@ impl<T> LinkedList<T> {
                 match self.head.compare_exchange_weak(
                     std::ptr::null_mut(),
                     boxed,
-                    Ordering::Release,
+                    Ordering::AcqRel,
                     Ordering::Relaxed,
                 ) {
                     Ok(_) => {
                         let _ = self.tail.compare_exchange(
                             std::ptr::null_mut(),
                             boxed,
-                            Ordering::Release,
+                            Ordering::AcqRel,
                             Ordering::Relaxed,
                         );
                         self.length.fetch_add(1, Ordering::Relaxed);
@@ -81,7 +100,7 @@ impl<T> LinkedList<T> {
                     .compare_exchange(
                         guard.deref_mut() as *mut Node<T>,
                         boxed,
-                        Ordering::Release,
+                        Ordering::AcqRel,
                         Ordering::Relaxed,
                     )
                     .is_ok()
@@ -92,7 +111,7 @@ impl<T> LinkedList<T> {
                             .compare_exchange(
                                 std::ptr::null_mut(),
                                 boxed,
-                                Ordering::Release,
+                                Ordering::AcqRel,
                                 Ordering::Relaxed,
                             );
                     }

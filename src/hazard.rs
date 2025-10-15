@@ -37,6 +37,11 @@ impl<T> Deref for Guard<'_, T> {
     }
 }
 
+///SAFETY:
+///  This method can cause safety issues so it must be handled with care.
+///  If two threads deref_mut the guard to the same underlying T we will
+///  then have two mutable pointers to the same thing. If they are used to
+///  read or write at the same time, we will run into undefined behaviour.
 impl<T> DerefMut for Guard<'_, T> {
     fn deref_mut(&mut self) -> &mut Self::Target {
         unsafe { &mut (*self.data) }
