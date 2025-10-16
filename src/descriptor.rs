@@ -224,6 +224,7 @@ impl<'a, T> RawDescriptor<'a, T> {
                         Operation::Iterate(n) => panic!("Iteration not yet supported"),
                     }
                     status.store(2, Ordering::Release);
+                    Self::recursive(status, ptr, pending, next, current_node, op);
                 }
                 2 => {
                     pending.store(false, Ordering::Release);
