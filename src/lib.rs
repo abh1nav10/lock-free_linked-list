@@ -9,6 +9,4 @@ pub use crate::hazard::HazPtrHolder;
 use crate::hazard::HazPtrObject;
 pub use crate::hazard::Retired;
 
-use crate::descriptor::Descriptor;
-pub use crate::descriptor::Mile;
-use crate::descriptor::RawDescriptor;
+use crate::list::Node;

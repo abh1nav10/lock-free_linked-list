@@ -1,9 +1,6 @@
 #![allow(unused_imports)]
 #![allow(dead_code)]
-use crate::Descriptor;
 use crate::HazPtrHolder;
-use crate::Mile;
-use crate::RawDescriptor;
 use crate::Retired;
 use std::marker::PhantomData;
 use std::ops::DerefMut;
@@ -11,9 +8,9 @@ use std::sync::atomic::Ordering;
 use std::sync::atomic::{AtomicPtr, AtomicUsize};
 
 pub struct Node<T> {
-    value: T,
-    prev: AtomicPtr<Node<T>>,
-    next: AtomicPtr<Node<T>>,
+    pub(crate) value: T,
+    pub(crate) prev: AtomicPtr<Node<T>>,
+    pub(crate) next: AtomicPtr<Node<T>>,
 }
 
 impl<T> Node<T> {
@@ -22,21 +19,6 @@ impl<T> Node<T> {
             value,
             prev: AtomicPtr::new(std::ptr::null_mut()),
             next: AtomicPtr::new(std::ptr::null_mut()),
-        }
-    }
-}
-
-impl<T> Mile for Node<T> {
-    fn first(ptr1: *mut Self, ptr2: *mut Self) {
-        unsafe {
-            (*ptr1).next.store(ptr2, Ordering::Release);
-            (*ptr2).prev.store(ptr1, Ordering::Release);
-        }
-    }
-    fn second(ptr1: *mut Self, ptr2: *mut Self) {
-        unsafe {
-            (*ptr1).prev.store(ptr2, Ordering::Release);
-            (*ptr2).next.store(ptr1, Ordering::Release);
         }
     }
 }
@@ -88,8 +70,6 @@ impl<T> LinkedList<T> {
                     }
                 }
             } else {
-                let mut guard = current.expect("Has to be there");
-                // the try_or_help method needs to be called
             }
         }
     }
