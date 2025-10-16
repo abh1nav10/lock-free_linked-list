@@ -10,7 +10,6 @@ use std::sync::atomic::{AtomicPtr, AtomicUsize};
 pub struct Node<T> {
     pub(crate) value: T,
     pub(crate) prev: AtomicPtr<Node<T>>,
-    pub(crate) next: AtomicPtr<Node<T>>,
 }
 
 impl<T> Node<T> {
@@ -18,7 +17,6 @@ impl<T> Node<T> {
         Self {
             value,
             prev: AtomicPtr::new(std::ptr::null_mut()),
-            next: AtomicPtr::new(std::ptr::null_mut()),
         }
     }
 }

@@ -14,7 +14,6 @@ static DELETER2: DropPointer = DropPointer::new();
 pub enum Operation {
     InsertHead,
     DeleteTail,
-    Iterate(usize),
 }
 
 pub struct Descriptor<'a, T> {
@@ -63,10 +62,10 @@ impl<'a, T> RawDescriptor<'a, T> {
         &self,
         ptr: &'a AtomicPtr<Node<T>>,
         next: *mut Node<T>,
-        deleter: &'static dyn Deleter,
         op: Operation,
+        deleter: &'static dyn Deleter,
     ) {
-        let new_descriptor = Box::into_raw(Box::new(Descriptor::new(
+        let new_descriptor: *mut Descriptor<'a, T> = Box::into_raw(Box::new(Descriptor::new(
             ptr,
             next,
             AtomicUsize::new(0),
@@ -74,13 +73,12 @@ impl<'a, T> RawDescriptor<'a, T> {
             op,
             deleter,
         )));
+
         let next = unsafe { (*new_descriptor).next };
         let status = unsafe { &(*new_descriptor).status };
         let pending = unsafe { &(*new_descriptor).pending };
-        let op = unsafe { (*new_descriptor).op };
         loop {
             let a = self.descriptor.load(Ordering::Acquire);
-            // let mut guard = unsafe { holder.load(&self.descriptor) };
             if a.is_null() {
                 if self
                     .swap_null(new_descriptor, status, ptr, pending, next, op)
@@ -220,8 +218,9 @@ impl<'a, T> RawDescriptor<'a, T> {
                         Operation::InsertHead => {
                             Self::insert_head(next, current_node);
                         }
-                        Operation::DeleteTail => panic!("Deletion not yet supported"),
-                        Operation::Iterate(n) => panic!("Iteration not yet supported"),
+                        Operation::DeleteTail => {
+                            Self::delete_tail(current_node);
+                        }
                     }
                     status.store(2, Ordering::Release);
                     Self::recursive(status, ptr, pending, next, current_node, op);
@@ -237,20 +236,31 @@ impl<'a, T> RawDescriptor<'a, T> {
 
     // Updates the fields in accordance with head insertion.
     fn insert_head(new: *mut Node<T>, old: *mut Node<T>) {
-        if old.is_null() {
-            return;
-        }
-        unsafe {
-            (&(*new).next).store(old, Ordering::Release);
-            (&(*old).prev).store(new, Ordering::Release);
+        // Only checking if old is null does not suffice when deletion from tail is allowed. It
+        // needs be stored into a hazard pointer to prevent undefined behaviour because deletion
+        // might have removed that node after our is_null check but before dereferencing it. Hazard
+        // pointers do allow deletion but at the same time prevent undefined behaviour.
+        let mut holder = HazPtrHolder::default();
+        // Atomic pointer is needed because the load method on the HazPtrHolder accepts a reference
+        // to an atomic pointer as the input.
+        let atomic_ptr = AtomicPtr::new(old);
+        let mut guard = unsafe { holder.load(&atomic_ptr) };
+        if guard.is_some() {
+            unsafe {
+                (&(*old).prev).store(new, Ordering::Release);
+            }
         }
     }
 
-    fn delete_tail(new: *mut Node<T>, old: *mut Node<T>) {
-        todo!()
-    }
-
-    fn iterate() {
-        todo!()
+    // The delete_tail method takes the pointer to the node that is to be dropped but does not drop
+    // it immediately. Instead it creates a hazptrholder for it and then swaps through it because
+    // doing so will check whether any other thread holds a pointer to the node before dropping it.
+    fn delete_tail(old: *mut Node<T>) {
+        let mut holder = HazPtrHolder::default();
+        let atomic_ptr = AtomicPtr::new(old);
+        let mut wrapper = unsafe { holder.swap(&atomic_ptr, std::ptr::null_mut(), &DELETER1) };
+        if let Some(mut wrapper) = wrapper {
+            wrapper.retire();
+        }
     }
 }
