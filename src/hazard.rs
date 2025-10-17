@@ -188,6 +188,9 @@ impl<T> HazPtrObject for HazPtrObjectWrapper<'_, T> {
     ///SAFETY:
     ///  The user must make sure that a retired pointer is not retired again.
     fn retire(&mut self) {
+        if self.inner.is_null() {
+            return;
+        }
         let domain = self.domain();
         let current = (&domain.ret.head).load(Ordering::SeqCst);
         loop {
