@@ -29,7 +29,7 @@ pub(crate) struct Descriptor<'a, T> {
     ptr: &'a AtomicPtr<Node<T>>,
     next: *mut Node<T>,
     status: AtomicUsize,
-    pending: AtomicUsize,
+    pending: AtomicBool,
     op: Operation,
     deleter: &'static dyn Deleter,
 }
@@ -47,7 +47,7 @@ impl<'a, T> Descriptor<'a, T> {
         ptr: &'a AtomicPtr<Node<T>>,
         next: *mut Node<T>,
         status: AtomicUsize,
-        pending: AtomicUsize,
+        pending: AtomicBool,
         op: Operation,
         deleter: &'static dyn Deleter,
     ) -> Self {
@@ -82,14 +82,13 @@ impl<'a, T> RawDescriptor<'a, T> {
             ptr,
             next,
             AtomicUsize::new(0),
-            AtomicUsize::new(0),
+            AtomicBool::new(true),
             op,
             deleter,
         )));
         let status = unsafe { &(*new_descriptor).status };
         let pending = unsafe { &(*new_descriptor).pending };
         loop {
-            //let a = self.descriptor.load(Ordering::Acquire);
             if self.descriptor.load(Ordering::Acquire).is_null() {
                 if self
                     .swap_null(new_descriptor, status, ptr, pending, next, op)
@@ -98,38 +97,51 @@ impl<'a, T> RawDescriptor<'a, T> {
                     break;
                 }
             } else {
-                // Success in the CAS means that the descriptor and the node are not going to be
-                // dropped as long as the this descriptor finishes its task. The node is also not
-                // is guaranteed by the fact that for now we will support insertion and deletion
-                // from separate ends and the logic of deletion to deal with edge cases that may
-                // cause corruption will be dealt in detail on implementing the delete method
-                if (unsafe { &(*self.descriptor.load(Ordering::Acquire)).pending })
-                    .compare_exchange(1, 2, Ordering::AcqRel, Ordering::Relaxed)
-                    .is_ok()
-                    // doesnt work as it takes away lock freedom
-                {
-                    let mut swapholder = HazPtrHolder::default();
-                    let mut wrapper = unsafe {
-                        swapholder.swap(
-                            &self.descriptor,
-                            new_descriptor,
-                            (*self.descriptor.load(Ordering::Acquire)).deleter,
-                        )
-                    };
-                    if let Some(mut wrapper) = wrapper {
-                        wrapper.retire();
+                // The idea is to first load the current descriptor into a hazard pointer if we do
+                // not get back a guard we just simply loop back. If we get back a guard we try to
+                // get to the pending field of the descriptor and check whether it is true or
+                // false, if not false then we just help. If it is false we try to CAS the descriptor
+                // with our new descriptor, if successful we proceed with our operation, otherwise
+                // we just help.
+                let mut pending_holder = HazPtrHolder::default();
+                let mut pending_holder_guard = unsafe { pending_holder.load(&self.descriptor) };
+                if let Some(mut thing) = pending_holder_guard {
+                    if !thing.deref_mut().pending.load(Ordering::Acquire) {
+                        if self
+                            .descriptor
+                            .compare_exchange(
+                                thing.deref_mut() as *mut Descriptor<'a, T>,
+                                new_descriptor,
+                                Ordering::AcqRel,
+                                Ordering::Relaxed,
+                            )
+                            .is_ok()
+                        {
+                            let raw = thing.deref_mut() as *mut Descriptor<'a, T>;
+                            let mut swapholder = HazPtrHolder::default();
+                            let atomic_ptr_descriptor: AtomicPtr<Descriptor<'a, T>> =
+                                AtomicPtr::new(raw);
+                            let mut wrapper = unsafe {
+                                swapholder.swap(
+                                    &atomic_ptr_descriptor,
+                                    std::ptr::null_mut(),
+                                    ((*raw).deleter),
+                                )
+                            };
+                            if let Some(mut wrapper) = wrapper {
+                                wrapper.retire();
+                            }
+                            Self::recursive_insert(
+                                status,
+                                ptr,
+                                pending,
+                                next,
+                                ptr.load(Ordering::Acquire),
+                                op,
+                            );
+                            break;
+                        }
                     }
-                    Self::recursive_insert(
-                        status,
-                        ptr,
-                        pending,
-                        next,
-                        ptr.load(Ordering::Acquire),
-                        op,
-                    );
-                    break;
-                } else {
-                    self.help_insert();
                 }
             }
         }
@@ -144,7 +156,7 @@ impl<'a, T> RawDescriptor<'a, T> {
         new_descriptor: *mut Descriptor<'a, T>,
         status: &'_ AtomicUsize,
         ptr: &'_ AtomicPtr<Node<T>>,
-        pending: &'_ AtomicUsize,
+        pending: &'_ AtomicBool,
         next: *mut Node<T>,
         op: Operation,
     ) -> Result<(), ()> {
@@ -186,36 +198,34 @@ impl<'a, T> RawDescriptor<'a, T> {
     fn help_insert(&self) {
         let mut descriptor_holder = HazPtrHolder::default();
         let mut descriptor_guard = unsafe { descriptor_holder.load(&self.descriptor) };
-        if descriptor_guard.is_some() {
+        if let Some(_) = descriptor_guard {
             let pointer = descriptor_guard.expect("Has to be there");
             let mut node_holder = HazPtrHolder::default();
             let mut node_guard =
                 unsafe { node_holder.load(&(*self.descriptor.load(Ordering::Acquire)).ptr) };
-            if node_guard.is_some() {
-                let mut next_node_holder = HazPtrHolder::default();
-                // We need this atomic pointer solely for guarding the next with a hazard pointer,
-                // this is done because the next field inside the descriptor struct is suppossed to
-                // be a raw pointer to Node<T> but the load method of HazPtrHolder requires an
-                // atomic pointer.
-                let next_atomic_ptr =
-                    unsafe { AtomicPtr::new((*self.descriptor.load(Ordering::Acquire)).next) };
-                let mut next_node_guard = unsafe { next_node_holder.load(&next_atomic_ptr) };
-                if next_node_guard.is_some() {
-                    let status = &pointer.status;
-                    let pending = &pointer.pending;
-                    let next = pointer.next;
-                    let op = pointer.op;
-                    let pointer = &pointer.ptr;
-                    Self::recursive_insert(
-                        status,
-                        pointer,
-                        pending,
-                        next,
-                        node_guard.expect("Has to be there").deref_mut() as *mut Node<T>,
-                        op,
-                    );
-                }
-            }
+
+            let mut next_node_holder = HazPtrHolder::default();
+            // We need this atomic pointer solely for guarding the next with a hazard pointer,
+            // this is done because the next field inside the descriptor struct is suppossed to
+            // be a raw pointer to Node<T> but the load method of HazPtrHolder requires an
+            // atomic pointer.
+            let next_atomic_ptr =
+                unsafe { AtomicPtr::new((*self.descriptor.load(Ordering::Acquire)).next) };
+            let mut next_node_guard = unsafe { next_node_holder.load(&next_atomic_ptr) };
+
+            let status = &pointer.status;
+            let pending = &pointer.pending;
+            let next = pointer.next;
+            let op = pointer.op;
+            let pointer = &pointer.ptr;
+            Self::recursive_insert(
+                status,
+                pointer,
+                pending,
+                next,
+                node_guard.expect("Has to be there").deref_mut() as *mut Node<T>,
+                op,
+            );
         }
     }
 
@@ -225,13 +235,13 @@ impl<'a, T> RawDescriptor<'a, T> {
     fn recursive_insert(
         status: &'_ AtomicUsize,
         ptr: &'_ AtomicPtr<Node<T>>,
-        pending: &'_ AtomicUsize,
+        pending: &'_ AtomicBool,
         next: *mut Node<T>,
         current_node: *mut Node<T>,
         op: Operation,
     ) {
         match pending.load(Ordering::Acquire) {
-            0 => match status.load(Ordering::Acquire) {
+            true => match status.load(Ordering::Acquire) {
                 0 => {
                     ptr.store(next, Ordering::Release);
                     // Using store instead of CAS can corrupt the process, assume that the status
@@ -253,12 +263,12 @@ impl<'a, T> RawDescriptor<'a, T> {
                     Self::recursive_insert(status, ptr, pending, next, current_node, op);
                 }
                 2 => {
-                    pending.compare_exchange(0, 1, Ordering::AcqRel, Ordering::Relaxed);
+                    // instead of doing this maybe i will have to swap the descriptor pointer
+                    pending.store(false, Ordering::Release);
                 }
                 _ => unreachable!(),
             },
-            1 => return,
-            _ => unreachable!(),
+            false => return,
         }
     }
 
