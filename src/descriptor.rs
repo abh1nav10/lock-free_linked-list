@@ -11,21 +11,34 @@ static DELETER1: DropBox = DropBox::new();
 static DELETER2: DropPointer = DropPointer::new();
 
 #[derive(Copy, Clone)]
-pub enum Operation {
+pub(crate) enum Operation {
     InsertHead,
     DeleteTail,
 }
 
-pub struct Descriptor<'a, T> {
+// Status field helped other helper threads to help efficiently by looking at how much
+// of the task has been completed and the pending field was introduced to keep a broad eye
+// on whether the entire task has been completed. It was there for other threads to try
+// to CAS from false to true thereby disallowing other threads from taking a position
+// in the raw descriptor. However, I found out that doing so leaves a vulnerability.
+// There might be other helper threads who in the process of helping try to store
+// false again into the pending field which would allow other threads to swap the
+// descriptor field in the raw dexcriptor again. Thus we have to prevent this by using
+// AtomicUsize here as well.
+pub(crate) struct Descriptor<'a, T> {
     ptr: &'a AtomicPtr<Node<T>>,
     next: *mut Node<T>,
     status: AtomicUsize,
-    pending: AtomicBool,
+    pending: AtomicUsize,
     op: Operation,
     deleter: &'static dyn Deleter,
 }
 
-pub struct RawDescriptor<'a, T> {
+// The linked list based FIFO queue will have two raw descriptors, one for insertion through head
+// and one for deletion through tail. No other raw descriptors will be created as that would
+// violate the safety requirements. It most likely will corrupt our list and in many ways can
+// cause undefined behaviour.
+pub(crate) struct RawDescriptor<'a, T> {
     descriptor: AtomicPtr<Descriptor<'a, T>>,
 }
 
@@ -34,7 +47,7 @@ impl<'a, T> Descriptor<'a, T> {
         ptr: &'a AtomicPtr<Node<T>>,
         next: *mut Node<T>,
         status: AtomicUsize,
-        pending: AtomicBool,
+        pending: AtomicUsize,
         op: Operation,
         deleter: &'static dyn Deleter,
     ) -> Self {
@@ -58,7 +71,7 @@ impl<'a, T> RawDescriptor<'a, T> {
 }
 
 impl<'a, T> RawDescriptor<'a, T> {
-    pub fn initiate(
+    pub fn insert(
         &self,
         ptr: &'a AtomicPtr<Node<T>>,
         next: *mut Node<T>,
@@ -69,17 +82,15 @@ impl<'a, T> RawDescriptor<'a, T> {
             ptr,
             next,
             AtomicUsize::new(0),
-            AtomicBool::new(true),
+            AtomicUsize::new(0),
             op,
             deleter,
         )));
-
-        let next = unsafe { (*new_descriptor).next };
         let status = unsafe { &(*new_descriptor).status };
         let pending = unsafe { &(*new_descriptor).pending };
         loop {
-            let a = self.descriptor.load(Ordering::Acquire);
-            if a.is_null() {
+            //let a = self.descriptor.load(Ordering::Acquire);
+            if self.descriptor.load(Ordering::Acquire).is_null() {
                 if self
                     .swap_null(new_descriptor, status, ptr, pending, next, op)
                     .is_ok()
@@ -92,20 +103,33 @@ impl<'a, T> RawDescriptor<'a, T> {
                 // is guaranteed by the fact that for now we will support insertion and deletion
                 // from separate ends and the logic of deletion to deal with edge cases that may
                 // cause corruption will be dealt in detail on implementing the delete method
-                if (unsafe { &(*a).pending })
-                    .compare_exchange(false, true, Ordering::AcqRel, Ordering::Relaxed)
+                if (unsafe { &(*self.descriptor.load(Ordering::Acquire)).pending })
+                    .compare_exchange(1, 2, Ordering::AcqRel, Ordering::Relaxed)
                     .is_ok()
+                    // doesnt work as it takes away lock freedom
                 {
                     let mut swapholder = HazPtrHolder::default();
-                    let mut wrapper =
-                        unsafe { swapholder.swap(&self.descriptor, new_descriptor, (*a).deleter) };
+                    let mut wrapper = unsafe {
+                        swapholder.swap(
+                            &self.descriptor,
+                            new_descriptor,
+                            (*self.descriptor.load(Ordering::Acquire)).deleter,
+                        )
+                    };
                     if let Some(mut wrapper) = wrapper {
                         wrapper.retire();
                     }
-                    Self::recursive(status, ptr, pending, next, ptr.load(Ordering::Acquire), op);
+                    Self::recursive_insert(
+                        status,
+                        ptr,
+                        pending,
+                        next,
+                        ptr.load(Ordering::Acquire),
+                        op,
+                    );
                     break;
                 } else {
-                    self.help();
+                    self.help_insert();
                 }
             }
         }
@@ -120,7 +144,7 @@ impl<'a, T> RawDescriptor<'a, T> {
         new_descriptor: *mut Descriptor<'a, T>,
         status: &'_ AtomicUsize,
         ptr: &'_ AtomicPtr<Node<T>>,
-        pending: &'_ AtomicBool,
+        pending: &'_ AtomicUsize,
         next: *mut Node<T>,
         op: Operation,
     ) -> Result<(), ()> {
@@ -134,7 +158,7 @@ impl<'a, T> RawDescriptor<'a, T> {
             )
             .is_ok()
         {
-            Self::recursive(status, ptr, pending, next, std::ptr::null_mut(), op);
+            Self::recursive_insert(status, ptr, pending, next, std::ptr::null_mut(), op);
             Ok(())
         } else {
             Err(())
@@ -159,7 +183,7 @@ impl<'a, T> RawDescriptor<'a, T> {
     /// operation wherein if ever a new node is seen which is different from what was expected then
     /// the status field will invariably point to completed in which case our thread will not
     /// perform the dereferencing and the update of the previous field, but instead loop back.
-    fn help(&self) {
+    fn help_insert(&self) {
         let mut descriptor_holder = HazPtrHolder::default();
         let mut descriptor_guard = unsafe { descriptor_holder.load(&self.descriptor) };
         if descriptor_guard.is_some() {
@@ -182,7 +206,7 @@ impl<'a, T> RawDescriptor<'a, T> {
                     let next = pointer.next;
                     let op = pointer.op;
                     let pointer = &pointer.ptr;
-                    Self::recursive(
+                    Self::recursive_insert(
                         status,
                         pointer,
                         pending,
@@ -198,20 +222,23 @@ impl<'a, T> RawDescriptor<'a, T> {
     /// The recursive function allows threads to see how much of the task of a given descriptor is
     /// completed and help accordingly.
     /// Stack overflow won't be an issue because the steps are bounded by a fixed maxima.
-    fn recursive(
+    fn recursive_insert(
         status: &'_ AtomicUsize,
         ptr: &'_ AtomicPtr<Node<T>>,
-        pending: &'_ AtomicBool,
+        pending: &'_ AtomicUsize,
         next: *mut Node<T>,
         current_node: *mut Node<T>,
         op: Operation,
     ) {
         match pending.load(Ordering::Acquire) {
-            true => match status.load(Ordering::Acquire) {
+            0 => match status.load(Ordering::Acquire) {
                 0 => {
                     ptr.store(next, Ordering::Release);
-                    status.store(1, Ordering::Release);
-                    Self::recursive(status, ptr, pending, next, current_node, op);
+                    // Using store instead of CAS can corrupt the process, assume that the status
+                    // has already reached to 2 but there is still a possibility of it being
+                    // 1 by other threads who were in the process of helping.
+                    status.compare_exchange(0, 1, Ordering::AcqRel, Ordering::Relaxed);
+                    Self::recursive_insert(status, ptr, pending, next, current_node, op);
                 }
                 1 => {
                     match op {
@@ -222,15 +249,16 @@ impl<'a, T> RawDescriptor<'a, T> {
                             Self::delete_tail(current_node);
                         }
                     }
-                    status.store(2, Ordering::Release);
-                    Self::recursive(status, ptr, pending, next, current_node, op);
+                    status.compare_exchange(1, 2, Ordering::AcqRel, Ordering::Relaxed);
+                    Self::recursive_insert(status, ptr, pending, next, current_node, op);
                 }
                 2 => {
-                    pending.store(false, Ordering::Release);
+                    pending.compare_exchange(0, 1, Ordering::AcqRel, Ordering::Relaxed);
                 }
                 _ => unreachable!(),
             },
-            false => return,
+            1 => return,
+            _ => unreachable!(),
         }
     }
 
@@ -263,4 +291,15 @@ impl<'a, T> RawDescriptor<'a, T> {
             wrapper.retire();
         }
     }
+
+    /*    fn delete(&self, ptr: &'a AtomicPtr<Node<T>>, deleter: &'static dyn Deleter) {
+        let new = Box::into_raw(Box::new(Descriptor::new(
+            ptr,
+            std::ptr::null_mut(),
+            AtomicUsize::new(0),
+            AtomicBool::new(true),
+            Operation::DeleteTail,
+            &DELETER1,
+        )));
+    }*/
 }
