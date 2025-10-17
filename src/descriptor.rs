@@ -215,24 +215,6 @@ impl<'a, T> RawDescriptor<'a, T> {
         }
     }
 
-    /// The help function when called first loads the descriptors into a hazard pointer, it it gets
-    /// back None it immediately loops back as there is no point forward. If it gets some it then
-    /// loads the current pointer to the node into a hazard pointer and does the same process. It
-    /// then does the same thing for the next node which has to be stored in the pointer. The way
-    /// this gurantees safety from the danger of corrupting the nodes of the linked list is the
-    /// fact that for every operation there is a specific descriptor. If all the nodes are loaded
-    /// successfully and they are the same as what we expected, then everyting obviosly goes well.
-    /// But there are many edge cases to consider. Assume after we load everything and move on to
-    /// the recursive function call some other thread already finishes the operation and then some
-    /// other thread tries to delete the node that we are about to dereference. There would be a
-    /// danger of dereferencing null pointers which is prevented by hazard pointer. Hence we are
-    /// safe from the point of view. Another is that assume we load the descriptor and before we
-    /// load the node some other thread inserts new one. Now when we load the ptr we are actually
-    /// looking at a different node than what we expected. If we update the previous feld of this
-    /// node the list will get corrupted. This is prevented by that unique descriptors for every
-    /// operation wherein if ever a new node is seen which is different from what was expected then
-    /// the status field will invariably point to completed in which case our thread will not
-    /// perform the dereferencing and the update of the previous field, but instead loop back.
     fn help(&self, op: Operation, raw: *mut Descriptor<'a, T>) {
         let mut node_holder = HazPtrHolder::default();
         let mut node_guard = unsafe { node_holder.load(&(*raw).ptr) };
@@ -334,6 +316,13 @@ impl<'a, T> RawDescriptor<'a, T> {
 
             let mut descriptor_holder = HazPtrHolder::default();
             if self.descriptor.load(Ordering::Acquire).is_null() {
+                let mut holder = HazPtrHolder::default();
+                let guard = unsafe { holder.load(ptr) };
+                let current_node = if let Some(mut thing) = guard {
+                    thing.deref_mut() as *mut Node<T>
+                } else {
+                    std::ptr::null_mut()
+                };
                 if self
                     .descriptor
                     .compare_exchange(
@@ -344,12 +333,11 @@ impl<'a, T> RawDescriptor<'a, T> {
                     )
                     .is_ok()
                 {
-                    let mut holder = HazPtrHolder::default();
-                    let guard = unsafe { holder.load(ptr) };
-                    let current_node = if let Some(mut thing) = guard {
-                        thing.deref_mut() as *mut Node<T>
+                    // take ownership of the T inside the node
+                    let value = if !current_node.is_null() {
+                        Some(unsafe { std::ptr::read(&(*current_node).value) })
                     } else {
-                        std::ptr::null_mut()
+                        None
                     };
                     Self::recursive_delete(status, ptr, pending, current_node);
                     break None;
@@ -360,6 +348,13 @@ impl<'a, T> RawDescriptor<'a, T> {
                 if let Some(mut thing) = descriptor_guard {
                     if !thing.deref_mut().pending.load(Ordering::Acquire) {
                         let current_raw = thing.deref_mut() as *mut Descriptor<T>;
+                        let mut aholder = HazPtrHolder::default();
+                        let mut aguard = unsafe { aholder.load(ptr) };
+                        let forw = if let Some(mut guard) = aguard {
+                            guard.deref_mut() as *mut Node<T>
+                        } else {
+                            std::ptr::null_mut()
+                        };
                         if self
                             .descriptor
                             .compare_exchange(current_raw, new, Ordering::AcqRel, Ordering::Relaxed)
@@ -374,15 +369,14 @@ impl<'a, T> RawDescriptor<'a, T> {
                             if let Some(mut wrapper) = wrapper {
                                 wrapper.retire();
                             }
-                            let mut aholder = HazPtrHolder::default();
-                            let mut aguard = unsafe { aholder.load(ptr) };
-                            let forw = if let Some(mut guard) = aguard {
-                                guard.deref_mut() as *mut Node<T>
+                            // take ownership of T in the node
+                            let value = if !forw.is_null() {
+                                Some(unsafe { std::ptr::read(&(*forw).value) })
                             } else {
-                                std::ptr::null_mut()
+                                None
                             };
                             Self::recursive_delete(status, ptr, pending, forw);
-                            break None;
+                            break value;
                         } else {
                             let drop = unsafe { Box::from_raw(new) };
                             std::mem::drop(drop);
