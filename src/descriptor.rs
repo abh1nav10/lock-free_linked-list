@@ -90,12 +90,7 @@ impl<'a, T> RawDescriptor<'a, T> {
 }
 
 impl<'a, T> RawDescriptor<'a, T> {
-    pub fn insert(
-        &self,
-        ptr: &'a AtomicPtr<Node<T>>,
-        next: *mut Node<T>,
-        deleter: &'static dyn Deleter,
-    ) {
+    pub fn insert(&self, ptr: &'a AtomicPtr<Node<T>>, next: *mut Node<T>) {
         loop {
             let new_descriptor: *mut Descriptor<'a, T> = Box::into_raw(Box::new(Descriptor::new(
                 ptr,
@@ -103,7 +98,7 @@ impl<'a, T> RawDescriptor<'a, T> {
                 AtomicUsize::new(0),
                 AtomicBool::new(true),
                 Operation::Insert,
-                deleter,
+                &DELETER1,
             )));
             let status = unsafe { &(*new_descriptor).status };
             let pending = unsafe { &(*new_descriptor).pending };
@@ -298,7 +293,7 @@ impl<'a, T> RawDescriptor<'a, T> {
         }
     }
 
-    pub fn delete(&self, ptr: &'a AtomicPtr<Node<T>>, deleter: &'static dyn Deleter) -> Option<T> {
+    pub fn delete(&self, ptr: &'a AtomicPtr<Node<T>>) -> Option<T> {
         loop {
             let new = Box::into_raw(Box::new(Descriptor::new(
                 ptr,
@@ -306,7 +301,7 @@ impl<'a, T> RawDescriptor<'a, T> {
                 AtomicUsize::new(0),
                 AtomicBool::new(true),
                 Operation::Delete,
-                deleter,
+                &DELETER1,
             )));
             let status = unsafe { &(*new).status };
             let pending = unsafe { &(*new).pending };
