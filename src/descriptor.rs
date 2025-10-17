@@ -340,7 +340,7 @@ impl<'a, T> RawDescriptor<'a, T> {
                         None
                     };
                     Self::recursive_delete(status, ptr, pending, current_node);
-                    break None;
+                    break value;
                 }
             } else {
                 let mut descriptor_holder = HazPtrHolder::default();
