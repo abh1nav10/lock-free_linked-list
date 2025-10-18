@@ -4,7 +4,7 @@ use std::marker::PhantomData;
 use std::sync::atomic::Ordering;
 use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicUsize};
 
-pub struct Node<T> {
+pub(crate) struct Node<T> {
     pub(crate) value: T,
     pub(crate) prev: AtomicPtr<Node<T>>,
     pub(crate) retired: AtomicBool,
@@ -83,5 +83,9 @@ impl<'a, T> LinkedList<'a, T> {
 
     pub fn delete_from_tail(&'a self) -> Option<T> {
         self.raw_descriptor.delete(&self.tail)
+    }
+
+    pub fn length(&self) -> usize {
+        self.length.load(Ordering::Relaxed)
     }
 }
