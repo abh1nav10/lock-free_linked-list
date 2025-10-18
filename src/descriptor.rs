@@ -116,9 +116,14 @@ impl<'a, T> RawDescriptor<'a, T> {
                 // false, if not false then we just help. If it is false we try to CAS the descriptor
                 // with our new descriptor, if successful we proceed with our operation, otherwise
                 // we just help.
+
                 let mut pending_holder = HazPtrHolder::default();
                 let mut pending_holder_guard = unsafe { pending_holder.load(&self.descriptor) };
                 if let Some(mut thing) = pending_holder_guard {
+                    let mut new_holder = HazPtrHolder::default();
+                    let new_ptr = AtomicPtr::new(new_descriptor);
+                    let mut new_guard =
+                        unsafe { new_holder.load(&new_ptr).expect("Has to be there") };
                     if !thing.deref_mut().pending.load(Ordering::Acquire) {
                         if self
                             .descriptor
@@ -151,6 +156,9 @@ impl<'a, T> RawDescriptor<'a, T> {
                                 next,
                                 ptr.load(Ordering::Acquire),
                             );
+                            std::mem::drop(thing);
+                            std::mem::drop(new_guard);
+                            HazPtrHolder::try_reclaim();
                             break;
                         } else {
                             let drop = unsafe { Box::from_raw(new_descriptor) };
@@ -159,6 +167,8 @@ impl<'a, T> RawDescriptor<'a, T> {
                                 thing.deref_mut().op,
                                 thing.deref_mut() as *mut Descriptor<'a, T>,
                             );
+                            std::mem::drop(thing);
+                            std::mem::drop(new_guard);
                             HazPtrHolder::try_reclaim();
                         }
                     } else {
@@ -168,6 +178,8 @@ impl<'a, T> RawDescriptor<'a, T> {
                             thing.deref_mut().op,
                             thing.deref_mut() as *mut Descriptor<'a, T>,
                         );
+                        std::mem::drop(thing);
+                        std::mem::drop(new_guard);
                         HazPtrHolder::try_reclaim();
                     }
                 }
@@ -187,6 +199,9 @@ impl<'a, T> RawDescriptor<'a, T> {
         pending: &'_ AtomicBool,
         next: *mut Node<T>,
     ) -> Result<(), ()> {
+        let mut desc_holder = HazPtrHolder::default();
+        let desc_atomic_ptr = AtomicPtr::new(new_descriptor);
+        let desc_guard = unsafe { desc_holder.load(&desc_atomic_ptr) };
         if self
             .descriptor
             .compare_exchange(
@@ -206,6 +221,8 @@ impl<'a, T> RawDescriptor<'a, T> {
                 std::ptr::null_mut()
             };
             Self::recursive_insert(status, ptr, pending, forward, std::ptr::null_mut());
+            std::mem::drop(desc_guard.expect("Has to be there"));
+            HazPtrHolder::try_reclaim();
             Ok(())
         } else {
             Err(())
@@ -314,12 +331,15 @@ impl<'a, T> RawDescriptor<'a, T> {
             let mut descriptor_holder = HazPtrHolder::default();
             if self.descriptor.load(Ordering::Acquire).is_null() {
                 let mut holder = HazPtrHolder::default();
-                let guard = unsafe { holder.load(ptr) };
-                let current_node = if let Some(mut thing) = guard {
+                let mut guard = unsafe { holder.load(ptr) };
+                let current_node = if let Some(ref mut thing) = guard {
                     thing.deref_mut() as *mut Node<T>
                 } else {
                     std::ptr::null_mut()
                 };
+                let mut desc_holder = HazPtrHolder::default();
+                let mut desc_ptr = AtomicPtr::new(new);
+                let mut a_guard = unsafe { desc_holder.load(&desc_ptr).expect("Has to be there") };
                 if self
                     .descriptor
                     .compare_exchange(
@@ -337,12 +357,21 @@ impl<'a, T> RawDescriptor<'a, T> {
                         None
                     };
                     Self::recursive_delete(status, ptr, pending, current_node);
+                    std::mem::drop(a_guard);
+                    if guard.is_some() {
+                        std::mem::drop(guard);
+                    }
+                    HazPtrHolder::try_reclaim();
                     break value;
                 }
             } else {
                 let mut descriptor_holder = HazPtrHolder::default();
                 let mut descriptor_guard = unsafe { descriptor_holder.load(&self.descriptor) };
                 if let Some(mut thing) = descriptor_guard {
+                    let mut new_holder = HazPtrHolder::default();
+                    let new_ptr = AtomicPtr::new(new);
+                    let mut new_guard =
+                        unsafe { new_holder.load(&new_ptr).expect("Has to be there") };
                     if !thing.deref_mut().pending.load(Ordering::Acquire) {
                         let current_raw = thing.deref_mut() as *mut Descriptor<T>;
                         let mut aholder = HazPtrHolder::default();
@@ -373,6 +402,9 @@ impl<'a, T> RawDescriptor<'a, T> {
                                 None
                             };
                             Self::recursive_delete(status, ptr, pending, forw);
+                            std::mem::drop(thing);
+                            std::mem::drop(new_guard);
+                            HazPtrHolder::try_reclaim();
                             break value;
                         } else {
                             let drop = unsafe { Box::from_raw(new) };
@@ -381,6 +413,8 @@ impl<'a, T> RawDescriptor<'a, T> {
                                 thing.deref_mut().op,
                                 thing.deref_mut() as *mut Descriptor<'a, T>,
                             );
+                            std::mem::drop(thing);
+                            std::mem::drop(new_guard);
                             HazPtrHolder::try_reclaim();
                         }
                     } else {
@@ -390,6 +424,8 @@ impl<'a, T> RawDescriptor<'a, T> {
                             thing.deref_mut().op,
                             thing.deref_mut() as *mut Descriptor<'a, T>,
                         );
+                        std::mem::drop(thing);
+                        std::mem::drop(new_guard);
                         HazPtrHolder::try_reclaim();
                     }
                 }
