@@ -159,6 +159,7 @@ impl<'a, T> RawDescriptor<'a, T> {
                                 thing.deref_mut().op,
                                 thing.deref_mut() as *mut Descriptor<'a, T>,
                             );
+                            HazPtrHolder::try_reclaim();
                         }
                     } else {
                         let drop = unsafe { Box::from_raw(new_descriptor) };
@@ -167,6 +168,7 @@ impl<'a, T> RawDescriptor<'a, T> {
                             thing.deref_mut().op,
                             thing.deref_mut() as *mut Descriptor<'a, T>,
                         );
+                        HazPtrHolder::try_reclaim();
                     }
                 }
             }
@@ -379,6 +381,7 @@ impl<'a, T> RawDescriptor<'a, T> {
                                 thing.deref_mut().op,
                                 thing.deref_mut() as *mut Descriptor<'a, T>,
                             );
+                            HazPtrHolder::try_reclaim();
                         }
                     } else {
                         let drop = unsafe { Box::from_raw(new) };
@@ -387,6 +390,7 @@ impl<'a, T> RawDescriptor<'a, T> {
                             thing.deref_mut().op,
                             thing.deref_mut() as *mut Descriptor<'a, T>,
                         );
+                        HazPtrHolder::try_reclaim();
                     }
                 }
             }

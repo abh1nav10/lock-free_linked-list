@@ -142,6 +142,17 @@ impl HazPtrHolder {
             return Some(wrapper);
         }
     }
+
+    pub fn get_domain() -> &'static HazPtrDomain {
+        &SHARED_DOMAIN
+    }
+
+    pub fn try_reclaim() {
+        let domain = Self::get_domain();
+        unsafe {
+            domain.ret.reclaim(&domain.list);
+        }
+    }
 }
 
 pub(crate) struct HazPtr {
@@ -189,6 +200,10 @@ impl<T> HazPtrObject for HazPtrObjectWrapper<'_, T> {
     ///  The user must make sure that a retired pointer is not retired again.
     fn retire(&mut self) {
         if self.inner.is_null() {
+            let domain = self.domain();
+            unsafe {
+                (&domain.ret).reclaim(&domain.list);
+            }
             return;
         }
         let domain = self.domain();
@@ -244,7 +259,7 @@ pub struct HazPtrDomain {
 }
 
 impl HazPtrDomain {
-    pub fn acquire(&self) -> &'static HazPtr {
+    fn acquire(&self) -> &'static HazPtr {
         if self.list.head.load(Ordering::SeqCst).is_null() {
             let hazptr = HazPtr {
                 ptr: AtomicPtr::new(std::ptr::null_mut()),
@@ -430,7 +445,36 @@ impl Retired {
                 now = next;
             }
         }
-        self.head.swap(remaining, Ordering::SeqCst);
+        // The following code guarantees that no elements are ever lost
+        loop {
+            if self
+                .head
+                .compare_exchange(
+                    std::ptr::null_mut(),
+                    remaining,
+                    Ordering::SeqCst,
+                    Ordering::Relaxed,
+                )
+                .is_ok()
+            {
+                return;
+            } else {
+                if remaining.is_null() {
+                    remaining = self.head.swap(std::ptr::null_mut(), Ordering::SeqCst);
+                } else {
+                    let mut safety_variable = remaining;
+                    while unsafe { !(*safety_variable).next.load(Ordering::SeqCst).is_null() } {
+                        safety_variable = unsafe { (*safety_variable).next.load(Ordering::SeqCst) };
+                    }
+                    let to_be_swapped = self.head.swap(std::ptr::null_mut(), Ordering::SeqCst);
+                    unsafe {
+                        (*safety_variable)
+                            .next
+                            .store(to_be_swapped, Ordering::SeqCst);
+                    }
+                }
+            }
+        }
     }
 }
 
