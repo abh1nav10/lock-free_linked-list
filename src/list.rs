@@ -8,6 +8,7 @@ pub(crate) struct Node<T> {
     pub(crate) value: T,
     pub(crate) prev: AtomicPtr<Node<T>>,
     pub(crate) retired: AtomicBool,
+    pub(crate) value_moved: AtomicBool,
 }
 
 impl<T> Node<T> {
@@ -17,37 +18,32 @@ impl<T> Node<T> {
             prev: AtomicPtr::new(std::ptr::null_mut()),
             // this field is to prevent that retirement of the same node more than once
             retired: AtomicBool::new(false),
+            value_moved: AtomicBool::new(false),
         }
     }
 }
 
-pub struct LinkedList<'a, T> {
+pub struct LinkedList<T> {
     length: AtomicUsize,
     head: AtomicPtr<Node<T>>,
     tail: AtomicPtr<Node<T>>,
-    raw_descriptor: RawDescriptor<'a, T>,
-    // 'a here is basically the lifetime of the head and tail which is in simple words the linked
-    // list itself. Its like saying that the linked list is valid only for as long as the linked
-    // list is valid.
     marker: PhantomData<Node<T>>,
 }
 
-unsafe impl<'a, T> Send for LinkedList<'a, T> where T: Send {}
-unsafe impl<'a, T> Sync for LinkedList<'a, T> where T: Sync {}
+unsafe impl<T> Send for LinkedList<T> where T: Send {}
+unsafe impl<T> Sync for LinkedList<T> where T: Sync {}
 
-impl<'a, T> LinkedList<'a, T> {
+impl<T> LinkedList<T> {
     pub fn new() -> Self {
-        let raw_one = RawDescriptor::new();
         Self {
             length: AtomicUsize::new(0),
             head: AtomicPtr::new(std::ptr::null_mut()),
             tail: AtomicPtr::new(std::ptr::null_mut()),
-            raw_descriptor: raw_one,
             marker: PhantomData,
         }
     }
 
-    pub fn insert_from_head(&'a self, value: T) {
+    pub fn insert_from_head<'a>(&'a self, value: T, raw_descriptor: &RawDescriptor<'a, T>) {
         let boxed = Box::into_raw(Box::new(Node::new(value)));
         loop {
             let current = self.head.load(Ordering::Acquire);
@@ -67,6 +63,7 @@ impl<'a, T> LinkedList<'a, T> {
                         // place otherwise the insert method has got all the capability to handle
                         // the case where head is an atomic pointer storing a null pointer.
                         self.tail.store(boxed, Ordering::Release);
+                        println!("Reached insert");
                         self.length.fetch_add(1, Ordering::Relaxed);
                         break;
                     }
@@ -75,17 +72,54 @@ impl<'a, T> LinkedList<'a, T> {
                     }
                 }
             } else {
-                (&self.raw_descriptor).insert(&self.head, boxed);
+                raw_descriptor.insert(&self.head, boxed);
+                println!("Reached insert");
+                self.length.fetch_add(1, Ordering::Relaxed);
                 break;
             }
         }
     }
 
-    pub fn delete_from_tail(&'a self) -> Option<T> {
-        self.raw_descriptor.delete(&self.tail)
+    pub fn delete_from_tail<'a>(&'a self, raw_descriptor: &RawDescriptor<'a, T>) -> Option<T> {
+        let ret = raw_descriptor.delete(&self.tail);
+        // has to be fixed, we never decrement the length count.. and it has to be done carefully
+        // one more issue that needs to be addresses is that the head is never converted to null
+        // once there are no elements in the list..that would leave the head with a dangling
+        // pointer once the last node is dropped from memory
+        println!("Reached delete");
+        self.length.fetch_sub(1, Ordering::Relaxed);
+        return ret;
     }
 
     pub fn length(&self) -> usize {
         self.length.load(Ordering::Relaxed)
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+    #[test]
+    fn test() {
+        let new = &LinkedList::new();
+        let raw = &RawDescriptor::new();
+        std::thread::scope(|s| {
+            for i in 0..5 {
+                s.spawn(move || {
+                    new.insert_from_head(i, &raw);
+                });
+            }
+        });
+        println!("a");
+        std::thread::scope(|s| {
+            for _ in 0..5 {
+                s.spawn(move || {
+                    let _ = new.delete_from_tail(&raw);
+                });
+            }
+        });
+        println!("b");
+        let len = new.length();
+        assert_eq!(0 as usize, len);
     }
 }

@@ -324,10 +324,9 @@ impl<'a, T> RawDescriptor<'a, T> {
             )));
             let status = unsafe { &(*new).status };
             let pending = unsafe { &(*new).pending };
-            if ptr.load(Ordering::Acquire).is_null() {
+            /*if ptr.load(Ordering::Acquire).is_null() {
                 return None;
-            }
-
+            }*/
             let mut descriptor_holder = HazPtrHolder::default();
             if self.descriptor.load(Ordering::Acquire).is_null() {
                 let mut holder = HazPtrHolder::default();
@@ -340,6 +339,11 @@ impl<'a, T> RawDescriptor<'a, T> {
                 let mut desc_holder = HazPtrHolder::default();
                 let mut desc_ptr = AtomicPtr::new(new);
                 let mut a_guard = unsafe { desc_holder.load(&desc_ptr).expect("Has to be there") };
+                /*let value = if !current_node.is_null() {
+                    Some(unsafe { std::ptr::read(&(*current_node).value) })
+                } else {
+                    None
+                };*/
                 if self
                     .descriptor
                     .compare_exchange(
@@ -350,19 +354,13 @@ impl<'a, T> RawDescriptor<'a, T> {
                     )
                     .is_ok()
                 {
-                    // take ownership of the T inside the node
-                    let value = if !current_node.is_null() {
-                        Some(unsafe { std::ptr::read(&(*current_node).value) })
-                    } else {
-                        None
-                    };
                     Self::recursive_delete(status, ptr, pending, current_node);
                     std::mem::drop(a_guard);
                     if guard.is_some() {
                         std::mem::drop(guard);
                     }
                     HazPtrHolder::try_reclaim();
-                    break value;
+                    break None;
                 }
             } else {
                 let mut descriptor_holder = HazPtrHolder::default();
@@ -381,6 +379,12 @@ impl<'a, T> RawDescriptor<'a, T> {
                         } else {
                             std::ptr::null_mut()
                         };
+                        /*let value = if !forw.is_null() {
+                            Some(unsafe { std::ptr::read(&(*forw).value) })
+                        } else {
+                            None
+                        };*/
+
                         if self
                             .descriptor
                             .compare_exchange(current_raw, new, Ordering::AcqRel, Ordering::Relaxed)
@@ -396,16 +400,12 @@ impl<'a, T> RawDescriptor<'a, T> {
                                 wrapper.retire();
                             }
                             // take ownership of T in the node
-                            let value = if !forw.is_null() {
-                                Some(unsafe { std::ptr::read(&(*forw).value) })
-                            } else {
-                                None
-                            };
+
                             Self::recursive_delete(status, ptr, pending, forw);
                             std::mem::drop(thing);
                             std::mem::drop(new_guard);
                             HazPtrHolder::try_reclaim();
-                            break value;
+                            break None;
                         } else {
                             let drop = unsafe { Box::from_raw(new) };
                             std::mem::drop(drop);
