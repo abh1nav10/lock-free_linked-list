@@ -173,7 +173,7 @@ pub(crate) trait HazPtrObject {
 }
 
 pub struct HazPtrObjectWrapper<'a, T> {
-    inner: *mut T,
+    pub(crate) inner: *mut T,
     domain: &'a HazPtrDomain,
     deleter: &'static dyn Deleter,
 }

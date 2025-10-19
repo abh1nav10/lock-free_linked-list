@@ -27,11 +27,13 @@ pub(crate) enum Operation {
 // AtomicUsize here as well.
 pub(crate) struct Descriptor<'a, T> {
     ptr: &'a AtomicPtr<Node<T>>,
+    tail_ptr: &'a AtomicPtr<Node<T>>,
     next: *mut Node<T>,
     status: AtomicUsize,
     pending: AtomicBool,
     op: Operation,
     deleter: &'static dyn Deleter,
+    retired: AtomicBool,
 }
 
 // The linked list based FIFO queue will have two raw descriptors, one for insertion through head
@@ -53,7 +55,18 @@ impl<'a, T> Drop for RawDescriptor<'a, T> {
             let wrapper =
                 unsafe { new_holder.swap(&self.descriptor, std::ptr::null_mut(), deleter) };
             if let Some(mut wrapper) = wrapper {
-                wrapper.retire();
+                if unsafe {
+                    (&(*wrapper.inner).retired).compare_exchange(
+                        false,
+                        true,
+                        Ordering::AcqRel,
+                        Ordering::Relaxed,
+                    )
+                }
+                .is_ok()
+                {
+                    wrapper.retire();
+                }
             }
         } else {
             return;
@@ -64,19 +77,23 @@ impl<'a, T> Drop for RawDescriptor<'a, T> {
 impl<'a, T> Descriptor<'a, T> {
     fn new(
         ptr: &'a AtomicPtr<Node<T>>,
+        tail_ptr: &'a AtomicPtr<Node<T>>,
         next: *mut Node<T>,
         status: AtomicUsize,
         pending: AtomicBool,
         op: Operation,
         deleter: &'static dyn Deleter,
+        retired: AtomicBool,
     ) -> Self {
         Self {
             ptr,
+            tail_ptr,
             next,
             status,
             pending,
             op,
             deleter,
+            retired,
         }
     }
 }
@@ -90,15 +107,22 @@ impl<'a, T> RawDescriptor<'a, T> {
 }
 
 impl<'a, T> RawDescriptor<'a, T> {
-    pub fn insert(&self, ptr: &'a AtomicPtr<Node<T>>, next: *mut Node<T>) {
+    pub fn insert(
+        &self,
+        ptr: &'a AtomicPtr<Node<T>>,
+        ptr_tail: &'a AtomicPtr<Node<T>>,
+        next: *mut Node<T>,
+    ) {
         loop {
             let new_descriptor: *mut Descriptor<'a, T> = Box::into_raw(Box::new(Descriptor::new(
                 ptr,
+                ptr_tail,
                 next,
                 AtomicUsize::new(0),
                 AtomicBool::new(true),
                 Operation::Insert,
                 &DELETER1,
+                AtomicBool::new(false),
             )));
             let status = unsafe { &(*new_descriptor).status };
             let pending = unsafe { &(*new_descriptor).pending };
@@ -147,7 +171,26 @@ impl<'a, T> RawDescriptor<'a, T> {
                                 )
                             };
                             if let Some(mut wrapper) = wrapper {
-                                wrapper.retire();
+                                // this code path ensures that the descriptor is retired only once
+                                // but double retirement can arise due to the drop implementation
+                                // therefore we introduce the retired field in descriptor...
+                                // calling the CAS in this code path seems redundant as the code
+                                // path already guarantees safety but this has to be done to ensure
+                                // that the retired field is updated to prevent the drop
+                                // implementation from double retiring
+                                if unsafe {
+                                    (*wrapper.inner)
+                                        .retired
+                                        .compare_exchange(
+                                            false,
+                                            true,
+                                            Ordering::AcqRel,
+                                            Ordering::Relaxed,
+                                        )
+                                        .is_ok()
+                                } {
+                                    wrapper.retire();
+                                }
                             }
                             Self::recursive_insert(
                                 status,
@@ -230,31 +273,50 @@ impl<'a, T> RawDescriptor<'a, T> {
     }
 
     fn help(&self, op: Operation, raw: *mut Descriptor<'a, T>) {
-        let mut node_holder = HazPtrHolder::default();
-        let mut node_guard = unsafe { node_holder.load(&(*raw).ptr) };
-        let mut next_node_holder = HazPtrHolder::default();
-        // We need this atomic pointer solely for guarding the next with a hazard pointer,
-        // this is done because the next field inside the descriptor struct is suppossed to
-        // be a raw pointer to Node<T> but the load method of HazPtrHolder requires an
-        // atomic pointer.
-        let next_atomic_ptr = unsafe { AtomicPtr::new((*raw).next) };
-        let mut next_node_guard = unsafe { next_node_holder.load(&next_atomic_ptr) };
-        let current_node = if let Some(mut thing) = next_node_guard {
-            thing.deref_mut() as *mut Node<T>
-        } else {
-            std::ptr::null_mut()
-        };
-
-        let status = unsafe { &(*raw).status };
-        let pending = unsafe { &(*raw).pending };
-        let next = unsafe { (*raw).next };
-        let pointer = unsafe { &(*raw).ptr };
         match op {
             Operation::Insert => {
+                let mut node_holder = HazPtrHolder::default();
+                let mut node_guard = unsafe { node_holder.load(&(*raw).ptr) };
+                let mut next_node_holder = HazPtrHolder::default();
+                // We need this atomic pointer solely for guarding the next with a hazard pointer,
+                // this is done because the next field inside the descriptor struct is suppossed to
+                // be a raw pointer to Node<T> but the load method of HazPtrHolder requires an
+                // atomic pointer.
+                let next_atomic_ptr = unsafe { AtomicPtr::new((*raw).next) };
+                let mut next_node_guard = unsafe { next_node_holder.load(&next_atomic_ptr) };
+                let next = if let Some(mut thing) = next_node_guard {
+                    thing.deref_mut() as *mut Node<T>
+                } else {
+                    std::ptr::null_mut()
+                };
+                let current_node = if let Some(mut thing) = node_guard {
+                    thing.deref_mut() as *mut Node<T>
+                } else {
+                    std::ptr::null_mut()
+                };
+
+                let status = unsafe { &(*raw).status };
+                let pending = unsafe { &(*raw).pending };
+                let pointer = unsafe { &(*raw).ptr };
                 Self::recursive_insert(status, pointer, pending, next, current_node);
             }
             Operation::Delete => {
-                Self::recursive_delete(status, pointer, pending, current_node);
+                let mut node_holder = HazPtrHolder::default();
+                let mut node_guard = unsafe { node_holder.load(&(*raw).tail_ptr) };
+                let mut next_node_holder = HazPtrHolder::default();
+
+                let current_node = if let Some(mut thing) = node_guard {
+                    thing.deref_mut() as *mut Node<T>
+                } else {
+                    std::ptr::null_mut()
+                };
+
+                let status = unsafe { &(*raw).status };
+                let pending = unsafe { &(*raw).pending };
+                let head_ptr = unsafe { &(*raw).ptr }; // We dont load the tail pointer into a hazptrholder because it really doesnt matter
+                let tail_pointer = unsafe { &(*raw).tail_ptr };
+
+                Self::recursive_delete(status, head_ptr, tail_pointer, pending, current_node);
             }
         }
     }
@@ -312,30 +374,34 @@ impl<'a, T> RawDescriptor<'a, T> {
         }
     }
 
-    pub fn delete(&self, ptr: &'a AtomicPtr<Node<T>>) -> Option<T> {
+    pub fn delete(
+        &self,
+        ptr: &'a AtomicPtr<Node<T>>,
+        tail_ptr: &'a AtomicPtr<Node<T>>,
+    ) -> Option<T> {
         loop {
             let new = Box::into_raw(Box::new(Descriptor::new(
                 ptr,
+                tail_ptr,
                 std::ptr::null_mut(),
                 AtomicUsize::new(0),
                 AtomicBool::new(true),
                 Operation::Delete,
                 &DELETER1,
+                AtomicBool::new(false),
             )));
             let status = unsafe { &(*new).status };
             let pending = unsafe { &(*new).pending };
-            /*if ptr.load(Ordering::Acquire).is_null() {
-                return None;
-            }*/
+
             let mut descriptor_holder = HazPtrHolder::default();
             if self.descriptor.load(Ordering::Acquire).is_null() {
                 let mut holder = HazPtrHolder::default();
                 let mut guard = unsafe { holder.load(ptr) };
-                let current_node = if let Some(ref mut thing) = guard {
+                /* let current_node = if let Some(ref mut thing) = guard {
                     thing.deref_mut() as *mut Node<T>
                 } else {
                     std::ptr::null_mut()
-                };
+                };*/
                 let mut desc_holder = HazPtrHolder::default();
                 let mut desc_ptr = AtomicPtr::new(new);
                 let mut a_guard = unsafe { desc_holder.load(&desc_ptr).expect("Has to be there") };
@@ -354,7 +420,17 @@ impl<'a, T> RawDescriptor<'a, T> {
                     )
                     .is_ok()
                 {
-                    Self::recursive_delete(status, ptr, pending, current_node);
+                    let current_node = if let Some(ref mut thing) = guard {
+                        thing.deref_mut() as *mut Node<T>
+                    } else {
+                        std::ptr::null_mut()
+                    };
+                    /*let value = if !current_node.is_null() {
+                        Some(unsafe { std::ptr::read(&(*current_node).value) })
+                    } else {
+                        None
+                    };*/
+                    Self::recursive_delete(status, ptr, tail_ptr, pending, current_node);
                     std::mem::drop(a_guard);
                     if guard.is_some() {
                         std::mem::drop(guard);
@@ -374,22 +450,22 @@ impl<'a, T> RawDescriptor<'a, T> {
                         let current_raw = thing.deref_mut() as *mut Descriptor<T>;
                         let mut aholder = HazPtrHolder::default();
                         let mut aguard = unsafe { aholder.load(ptr) };
-                        let forw = if let Some(mut guard) = aguard {
-                            guard.deref_mut() as *mut Node<T>
-                        } else {
-                            std::ptr::null_mut()
-                        };
-                        /*let value = if !forw.is_null() {
-                            Some(unsafe { std::ptr::read(&(*forw).value) })
-                        } else {
-                            None
-                        };*/
 
                         if self
                             .descriptor
                             .compare_exchange(current_raw, new, Ordering::AcqRel, Ordering::Relaxed)
                             .is_ok()
                         {
+                            let forw = if let Some(mut guard) = aguard {
+                                guard.deref_mut() as *mut Node<T>
+                            } else {
+                                std::ptr::null_mut()
+                            };
+                            /*let value = if !forw.is_null() {
+                                Some(unsafe { std::ptr::read(&(*forw).value) })
+                            } else {
+                                None
+                            };*/
                             let mut holder = HazPtrHolder::default();
                             let atomic_ptr =
                                 AtomicPtr::new(thing.deref_mut() as *mut Descriptor<'a, T>);
@@ -397,11 +473,23 @@ impl<'a, T> RawDescriptor<'a, T> {
                                 holder.swap(&atomic_ptr, std::ptr::null_mut(), &DELETER1)
                             };
                             if let Some(mut wrapper) = wrapper {
-                                wrapper.retire();
+                                if unsafe {
+                                    (*wrapper.inner)
+                                        .retired
+                                        .compare_exchange(
+                                            false,
+                                            true,
+                                            Ordering::AcqRel,
+                                            Ordering::Relaxed,
+                                        )
+                                        .is_ok()
+                                } {
+                                    wrapper.retire();
+                                }
                             }
                             // take ownership of T in the node
 
-                            Self::recursive_delete(status, ptr, pending, forw);
+                            Self::recursive_delete(status, ptr, tail_ptr, pending, forw);
                             std::mem::drop(thing);
                             std::mem::drop(new_guard);
                             HazPtrHolder::try_reclaim();
@@ -436,6 +524,7 @@ impl<'a, T> RawDescriptor<'a, T> {
     fn recursive_delete(
         status: &'_ AtomicUsize,
         ptr: &'_ AtomicPtr<Node<T>>,
+        ptr_tail: &'_ AtomicPtr<Node<T>>,
         pending: &'_ AtomicBool,
         current_node: *mut Node<T>,
     ) {
@@ -446,9 +535,22 @@ impl<'a, T> RawDescriptor<'a, T> {
                         return;
                     }
                     let prev = unsafe { (*current_node).prev.load(Ordering::Acquire) };
-                    ptr.compare_exchange(current_node, prev, Ordering::AcqRel, Ordering::Relaxed);
+                    if prev.is_null() {
+                        ptr.compare_exchange(
+                            current_node,
+                            std::ptr::null_mut(),
+                            Ordering::AcqRel,
+                            Ordering::Relaxed,
+                        );
+                    }
+                    ptr_tail.compare_exchange(
+                        current_node,
+                        prev,
+                        Ordering::AcqRel,
+                        Ordering::Relaxed,
+                    );
                     status.compare_exchange(0, 1, Ordering::AcqRel, Ordering::Relaxed);
-                    Self::recursive_delete(status, ptr, pending, current_node);
+                    Self::recursive_delete(status, ptr, ptr_tail, pending, current_node);
                 }
                 1 => {
                     if unsafe {
@@ -466,7 +568,7 @@ impl<'a, T> RawDescriptor<'a, T> {
                         }
                     }
                     status.compare_exchange(1, 2, Ordering::AcqRel, Ordering::Relaxed);
-                    Self::recursive_delete(status, ptr, pending, current_node);
+                    Self::recursive_delete(status, ptr, ptr_tail, pending, current_node);
                 }
                 2 => {
                     pending.store(false, Ordering::Release);

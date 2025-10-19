@@ -72,7 +72,7 @@ impl<T> LinkedList<T> {
                     }
                 }
             } else {
-                raw_descriptor.insert(&self.head, boxed);
+                raw_descriptor.insert(&self.head, &self.tail, boxed);
                 println!("Reached insert");
                 self.length.fetch_add(1, Ordering::Relaxed);
                 break;
@@ -81,13 +81,13 @@ impl<T> LinkedList<T> {
     }
 
     pub fn delete_from_tail<'a>(&'a self, raw_descriptor: &RawDescriptor<'a, T>) -> Option<T> {
-        let ret = raw_descriptor.delete(&self.tail);
-        // has to be fixed, we never decrement the length count.. and it has to be done carefully
-        // one more issue that needs to be addresses is that the head is never converted to null
-        // once there are no elements in the list..that would leave the head with a dangling
-        // pointer once the last node is dropped from memory
+        let ret = raw_descriptor.delete(&self.head, &self.tail);
+        // has to be fixed, we decrement the length count but dont get the underlying T yet..
+        // fix the delete method in descriptor.rs to return the underlying T appropriately
         println!("Reached delete");
-        self.length.fetch_sub(1, Ordering::Relaxed);
+        if ret.is_some() {
+            self.length.fetch_sub(1, Ordering::Relaxed);
+        }
         return ret;
     }
 
