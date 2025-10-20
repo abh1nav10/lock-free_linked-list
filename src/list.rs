@@ -82,10 +82,8 @@ impl<T> LinkedList<T> {
 
     pub fn delete_from_tail<'a>(&'a self, raw_descriptor: &RawDescriptor<'a, T>) -> Option<T> {
         let ret = raw_descriptor.delete(&self.head, &self.tail);
-        // has to be fixed, we decrement the length count but dont get the underlying T yet..
-        // fix the delete method in descriptor.rs to return the underlying T appropriately
-        println!("Reached delete");
         if ret.is_some() {
+            println!("Reached decrement subcount");
             self.length.fetch_sub(1, Ordering::Relaxed);
         }
         return ret;
@@ -110,7 +108,6 @@ mod test {
                 });
             }
         });
-        println!("a");
         std::thread::scope(|s| {
             for _ in 0..5 {
                 s.spawn(move || {
@@ -118,7 +115,6 @@ mod test {
                 });
             }
         });
-        println!("b");
         let len = new.length();
         assert_eq!(0 as usize, len);
     }
