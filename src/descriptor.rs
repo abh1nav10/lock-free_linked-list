@@ -587,13 +587,6 @@ impl<'a, T> RawDescriptor<'a, T> {
                 }
                 2 => {
                     let prev = unsafe { (*current_node).prev.load(Ordering::Acquire) };
-                    status.store(3, Ordering::Relaxed);
-                    ptr_tail.compare_exchange(
-                        current_node,
-                        prev,
-                        Ordering::AcqRel,
-                        Ordering::Relaxed,
-                    );
                     if unsafe {
                         (*current_node)
                             .retired
@@ -608,6 +601,14 @@ impl<'a, T> RawDescriptor<'a, T> {
                             wrapper.retire();
                         }
                     }
+                    status.store(3, Ordering::Relaxed);
+                    ptr_tail.compare_exchange(
+                        current_node,
+                        prev,
+                        Ordering::AcqRel,
+                        Ordering::Relaxed,
+                    );
+
                     pending.store(false, Ordering::Relaxed);
                 }
                 3 => {
