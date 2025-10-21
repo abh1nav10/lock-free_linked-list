@@ -48,7 +48,7 @@ impl<T> LinkedList<T> {
         loop {
             let current = self.head.load(Ordering::Acquire);
             if current.is_null() {
-                match self.head.compare_exchange_weak(
+                match self.head.compare_exchange(
                     std::ptr::null_mut(),
                     boxed,
                     Ordering::AcqRel,
