@@ -295,29 +295,24 @@ impl HazPtrDomain {
                 current = unsafe { (&(*current).next).load(Ordering::SeqCst) };
             }
         }
-        let mut now = &self.list.head;
+        let mut now = self.list.head.load(Ordering::SeqCst);
         loop {
             let mut new = HazPtr {
                 ptr: AtomicPtr::new(std::ptr::null_mut()),
                 next: AtomicPtr::new(std::ptr::null_mut()),
                 flag: AtomicBool::new(false),
             };
-            new.next = AtomicPtr::new(now.load(Ordering::SeqCst));
+            new.next = AtomicPtr::new(now);
             let boxed = Box::into_raw(Box::new(new));
             if self
                 .list
                 .head
-                .compare_exchange(
-                    now.load(Ordering::SeqCst),
-                    boxed,
-                    Ordering::SeqCst,
-                    Ordering::SeqCst,
-                )
+                .compare_exchange(now, boxed, Ordering::SeqCst, Ordering::SeqCst)
                 .is_ok()
             {
                 return unsafe { &*boxed };
             } else {
-                now = &self.list.head;
+                now = self.list.head.load(Ordering::SeqCst);
                 let drop = unsafe { Box::from_raw(boxed) };
                 std::mem::drop(drop);
                 while !current.is_null() {
@@ -511,5 +506,7 @@ mod test {
             wrapper.retire();
         }
         assert_eq!(check.get_number_of_drops(), 1 as usize);
+        let _ = unsafe { Box::from_raw(boxed2) };
+        std::mem::drop(check);
     }
 }
