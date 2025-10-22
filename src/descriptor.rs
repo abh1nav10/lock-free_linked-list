@@ -663,33 +663,18 @@ impl<'a, T> RawDescriptor<'a, T> {
         loop {
             match pending.load(Ordering::Acquire) {
                 true => match status.load(Ordering::Acquire) {
-                    1 => {
-                        if prev.is_null() {
-                            head_ptr.compare_exchange(
-                                actual_tail_ptr_guard.data,
-                                std::ptr::null_mut(),
-                                Ordering::AcqRel,
-                                Ordering::Relaxed,
-                            );
-                        }
-
-                        status.compare_exchange(1, 2, Ordering::AcqRel, Ordering::Relaxed);
-                        continue;
-                    }
                     2 => {
-                        let taken_value =
-                            unsafe { std::ptr::read(&(*actual_tail_ptr_guard.data).value) };
-                        let mut init = MaybeUninit::uninit();
-                        unsafe { init.write(taken_value) };
-                        let init_ptr = Box::into_raw(Box::new(init));
                         unsafe {
-                            (*actual_descriptor_guard.data)
-                                .taken_value
-                                .store(init_ptr, Ordering::Release);
-                            (*actual_descriptor_guard.data)
-                                .init_stored
-                                .store(true, Ordering::Release);
-                        }
+                                (*actual_descriptor_guard.data)
+                                    .success
+                                    .store(true, Ordering::Release)
+                            }
+                         tail_ptr.compare_exchange(
+                            actual_tail_ptr_guard.data,
+                            prev,
+                            Ordering::AcqRel,
+                            Ordering::Relaxed,
+                        );
                         if unsafe {
                             (*actual_tail_ptr_guard)
                                 .retired
@@ -707,50 +692,50 @@ impl<'a, T> RawDescriptor<'a, T> {
                             if let Some(mut wrapper) = wrapper {
                                 wrapper.retire();
                             }
-                        }
                         pending.store(false, Ordering::Release);
                         break;
                     }
-                    0 => {
-                        //status.compare_exchange(2, 3, Ordering::AcqRel, Ordering::Relaxed);
-                        let result = tail_ptr.compare_exchange(
-                            actual_tail_ptr_guard.data,
-                            prev,
-                            Ordering::AcqRel,
-                            Ordering::Relaxed,
-                        );
-                        if result.is_ok() {
-                            // this itself is blocking
-                            unsafe {
-                                (*actual_descriptor_guard.data)
-                                    .success
-                                    .store(true, Ordering::Release)
-                            }
-                            status.compare_exchange(0, 1, Ordering::AcqRel, Ordering::Relaxed);
-                            continue;
-                        } else {
-                            pending.store(false, Ordering::Release);
-                            break;
-                        }
-                        // if a thread reaches it is possible that some other thread managed to do
-                        // the compare and exchange stored the success in the descriptor and then
-                        // got preempted or it is also possible that it got prempted just after the
-                        // compare and swap... both of these cases can create a deadlock and we
-                        // have to guard against both of them...
-                        if unsafe {
+                    1 => {
+                        
+                        let taken_value =
+                            unsafe { std::ptr::read(&(*actual_tail_ptr_guard.data).value) };
+                        let mut init = MaybeUninit::uninit();
+                        unsafe { init.write(taken_value) };
+                        let init_ptr = Box::into_raw(Box::new(init));
+                        unsafe {
                             (*actual_descriptor_guard.data)
-                                .success
-                                .load(Ordering::Acquire)
-                        } {
-                            status.compare_exchange(0, 1, Ordering::AcqRel, Ordering::Relaxed);
-                            continue;
-                        } else {
+                                .taken_value
+                                .store(init_ptr, Ordering::Release);
+                            (*actual_descriptor_guard.data)
+                                .init_stored
+                                .store(true, Ordering::Release);
+                        }
+                        
+                        
+                        status.compare_exchange(1, 2, Ordering::AcqRel, Ordering::Relaxed);
+                        continue;
+                    }
+                    0 => {
+                        let current = tail_ptr.load(Ordering::Acquire);
+                        // the idea is to make the swapping of the tail_ptr the last step
+                        // therefore... helper threads will help when required and will just
+                        // instantly return when helping is not required or when pointer that we
+                        // expected to be stored into the tail_ptr is not actually there
+                        if current != actual_tail_ptr_guard.data {
                             pending.store(false, Ordering::Release);
                             break;
                         }
-                        // how do i make sure that even when the CAS succeded and the thread got
-                        // prempted... we continue the operation...same goes for the loop insert
-                        // method
+                        if prev.is_null() {
+                            head_ptr.compare_exchange(
+                                actual_tail_ptr_guard.data,
+                                std::ptr::null_mut(),
+                                Ordering::AcqRel,
+                                Ordering::Relaxed,
+                            );
+                        }
+                        status.compare_exchange(0, 1, Ordering::AcqRel, Ordering::Relaxed);
+                        continue;
+ 
                     }
                     _ => unreachable!(),
                 },
