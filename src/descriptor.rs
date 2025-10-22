@@ -691,7 +691,7 @@ impl<'a, T> RawDescriptor<'a, T> {
                             };
                             if let Some(mut wrapper) = wrapper {
                                 wrapper.retire();
-                            }
+                            }}
                         pending.store(false, Ordering::Release);
                         break;
                     }
