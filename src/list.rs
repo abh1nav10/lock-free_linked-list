@@ -98,18 +98,18 @@ impl<T> LinkedList<T> {
 mod test {
     use super::*;
     #[test]
-    fn test() {
+    fn test_one() {
         let new = &LinkedList::new();
         let raw = &RawDescriptor::new();
         std::thread::scope(|s| {
-            for i in 0..5 {
+            for i in 0..10 {
                 s.spawn(move || {
                     new.insert_from_head(i, &raw);
                 });
             }
         });
         std::thread::scope(|s| {
-            for _ in 0..5 {
+            for _ in 0..10 {
                 s.spawn(move || {
                     let _ = new.delete_from_tail(&raw);
                 });

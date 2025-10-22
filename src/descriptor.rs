@@ -377,48 +377,28 @@ impl<'a, T> RawDescriptor<'a, T> {
                 true => match status.load(Ordering::Acquire) {
                     1 => {
                         Self::insert_head(next, current);
-                        // Using store instead of CAS can corrupt the process, assume that the status
-                        // has already reached to 2 but there is still a possibility of it being
-                        // 1 by other threads who were in the process of helping.
-                        status.compare_exchange(0, 1, Ordering::AcqRel, Ordering::Relaxed);
+                        head_ptr.compare_exchange(
+                            current,
+                            next,
+                            Ordering::AcqRel,
+                            Ordering::Acquire,
+                        );
                         pending.store(false, Ordering::Release);
                         break;
                     }
                     0 => {
-                        let result = head_ptr.compare_exchange(
-                            current,
-                            next,
-                            Ordering::AcqRel,
-                            Ordering::Relaxed,
-                        );
-                        // the issue is that this is going to succeed even if the thing was once
-                        // stored then the thread was preempted and then everything was deleted..
-                        // head_ptr will again be null but the compare and swap will still succeed
-                        // TODO: resolve this issue
-                        if result.is_ok() {
-                            // this can be blocking
-                            unsafe {
-                                (*actual_descriptor_guard.data)
-                                    .success
-                                    .store(true, Ordering::Release);
-                            }
-
-                            status.compare_exchange(0, 1, Ordering::AcqRel, Ordering::Relaxed);
-                            continue;
-                        } else {
-                            pending.store(false, Ordering::Release);
-                        }
-                        if unsafe {
-                            (*actual_descriptor_guard.data)
-                                .success
-                                .load(Ordering::Acquire)
-                        } {
-                            status.compare_exchange(0, 1, Ordering::AcqRel, Ordering::Relaxed);
-                            continue;
-                        } else {
+                        let now = head_ptr.load(Ordering::Acquire);
+                        if now != current {
                             pending.store(false, Ordering::Release);
                             break;
                         }
+                        unsafe {
+                            (*actual_descriptor_guard.data)
+                                .success
+                                .store(true, Ordering::Release);
+                        }
+                        status.compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire);
+                        continue;
                     }
                     _ => unreachable!(),
                 },
@@ -665,20 +645,20 @@ impl<'a, T> RawDescriptor<'a, T> {
                 true => match status.load(Ordering::Acquire) {
                     2 => {
                         unsafe {
-                                (*actual_descriptor_guard.data)
-                                    .success
-                                    .store(true, Ordering::Release)
-                            }
-                         tail_ptr.compare_exchange(
+                            (*actual_descriptor_guard.data)
+                                .success
+                                .store(true, Ordering::Release)
+                        }
+                        tail_ptr.compare_exchange(
                             actual_tail_ptr_guard.data,
                             prev,
                             Ordering::AcqRel,
-                            Ordering::Relaxed,
+                            Ordering::Acquire,
                         );
                         if unsafe {
                             (*actual_tail_ptr_guard)
                                 .retired
-                                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Relaxed)
+                                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
                                 .is_ok()
                         } {
                             let mut hazholder = HazPtrHolder::default();
@@ -691,12 +671,12 @@ impl<'a, T> RawDescriptor<'a, T> {
                             };
                             if let Some(mut wrapper) = wrapper {
                                 wrapper.retire();
-                            }}
+                            }
+                        }
                         pending.store(false, Ordering::Release);
                         break;
                     }
                     1 => {
-                        
                         let taken_value =
                             unsafe { std::ptr::read(&(*actual_tail_ptr_guard.data).value) };
                         let mut init = MaybeUninit::uninit();
@@ -710,9 +690,7 @@ impl<'a, T> RawDescriptor<'a, T> {
                                 .init_stored
                                 .store(true, Ordering::Release);
                         }
-                        
-                        
-                        status.compare_exchange(1, 2, Ordering::AcqRel, Ordering::Relaxed);
+                        status.compare_exchange(1, 2, Ordering::AcqRel, Ordering::Acquire);
                         continue;
                     }
                     0 => {
@@ -735,7 +713,6 @@ impl<'a, T> RawDescriptor<'a, T> {
                         }
                         status.compare_exchange(0, 1, Ordering::AcqRel, Ordering::Relaxed);
                         continue;
- 
                     }
                     _ => unreachable!(),
                 },
