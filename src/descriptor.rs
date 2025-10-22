@@ -29,6 +29,8 @@ pub(crate) enum Operation {
 pub(crate) struct Descriptor<'a, T> {
     ptr: &'a AtomicPtr<Node<T>>,
     tail_ptr: &'a AtomicPtr<Node<T>>,
+    current: *mut Node<T>, // newest change to solve the biggest problems
+    success: AtomicBool,
     next: *mut Node<T>,
     status: AtomicUsize,
     pending: AtomicBool,
@@ -43,6 +45,13 @@ pub(crate) struct Descriptor<'a, T> {
     // we do not assume_init() on the maybeuninit
     taken_value: AtomicPtr<MaybeUninit<T>>,
     init_stored: AtomicBool,
+}
+
+enum SwapResult {
+    Success,
+    //Failure will include both failure in swapping and failure in the operation that occured later
+    //as in both the cases we have to loop back
+    Failure,
 }
 
 unsafe impl<'a, T> Send for Descriptor<'a, T> where T: Send {}
@@ -96,6 +105,8 @@ impl<'a, T> Descriptor<'a, T> {
     fn new(
         ptr: &'a AtomicPtr<Node<T>>,
         tail_ptr: &'a AtomicPtr<Node<T>>,
+        current: *mut Node<T>,
+        success: AtomicBool,
         next: *mut Node<T>,
         status: AtomicUsize,
         pending: AtomicBool,
@@ -108,6 +119,8 @@ impl<'a, T> Descriptor<'a, T> {
         Self {
             ptr,
             tail_ptr,
+            current,
+            success,
             next,
             status,
             pending,
@@ -136,10 +149,19 @@ impl<'a, T> RawDescriptor<'a, T> {
         next: *mut Node<T>,
     ) {
         loop {
+            let mut current_node_holder = HazPtrHolder::default();
+            let mut current_node_guard = unsafe { current_node_holder.load(ptr) };
+            let current_node = if let Some(ref mut guard) = current_node_guard {
+                guard.data
+            } else {
+                std::ptr::null_mut()
+            };
             let uninit = Box::into_raw(Box::new(MaybeUninit::uninit()));
             let new_descriptor: *mut Descriptor<'a, T> = Box::into_raw(Box::new(Descriptor::new(
                 ptr,
                 ptr_tail,
+                current_node,
+                AtomicBool::new(false),
                 next,
                 AtomicUsize::new(0),
                 AtomicBool::new(true),
@@ -152,7 +174,7 @@ impl<'a, T> RawDescriptor<'a, T> {
             let status = unsafe { &(*new_descriptor).status };
             let pending = unsafe { &(*new_descriptor).pending };
             if self.descriptor.load(Ordering::Acquire).is_null() {
-                if self.swap_null_insert(new_descriptor).is_ok() {
+                if let SwapResult::Success = self.swap_null_insert(new_descriptor) {
                     return;
                 }
             } else {
@@ -213,12 +235,26 @@ impl<'a, T> RawDescriptor<'a, T> {
                                 }
                             }
                             self.loop_insert(new_descriptor_guard.data);
-                            std::mem::drop(pending_holder_guard);
-                            std::mem::drop(new_descriptor_guard);
-                            HazPtrHolder::try_reclaim();
-                            break;
+                            // we now check whether the operation was actually successful
+                            if unsafe {
+                                (*new_descriptor_guard.data).success.load(Ordering::Acquire)
+                            } {
+                                std::mem::drop(pending_holder_guard);
+                                std::mem::drop(new_descriptor_guard);
+                                std::mem::drop(current_node_guard);
+                                HazPtrHolder::try_reclaim();
+                                break;
+                            } else {
+                                std::mem::drop(pending_holder_guard);
+                                std::mem::drop(current_node_guard);
+                                std::mem::drop(new_descriptor_guard);
+                                HazPtrHolder::try_reclaim();
+                                // loop back as the operation failed at a later stage
+                                continue;
+                            }
                         } else {
                             std::mem::drop(new_descriptor_guard);
+                            std::mem::drop(current_node_guard);
                             let _ = unsafe { Box::from_raw(new_descriptor) };
                             self.help(thing.data);
                             std::mem::drop(pending_holder_guard);
@@ -226,6 +262,7 @@ impl<'a, T> RawDescriptor<'a, T> {
                         }
                     } else {
                         std::mem::drop(new_descriptor_guard);
+                        std::mem::drop(current_node_guard);
                         let _ = unsafe { Box::from_raw(new_descriptor) };
                         self.help(thing.data);
                         std::mem::drop(pending_holder_guard);
@@ -240,12 +277,17 @@ impl<'a, T> RawDescriptor<'a, T> {
     // The function tries to compare and exchange expecting a null pointer which if succeeds we
     // initiate the recurive call and if fails we move forward to see if there is anyone we can
     // help before looping back.
-    fn swap_null_insert(&self, new_descriptor: *mut Descriptor<'a, T>) -> Result<(), ()> {
+    fn swap_null_insert(&self, new_descriptor: *mut Descriptor<'a, T>) -> SwapResult {
         let mut new_descriptor_holder = HazPtrHolder::default();
         let mut new_descriptor_guard = unsafe {
             new_descriptor_holder
                 .load(&AtomicPtr::new(new_descriptor))
                 .expect("Has to be there")
+        };
+        // respecting stack frames...therefore loading it into hazard pointers
+        let mut current_node_holder = HazPtrHolder::default();
+        let mut current_node_guard = unsafe {
+            current_node_holder.load(&AtomicPtr::new((*new_descriptor_guard.data).current))
         };
         if self
             .descriptor
@@ -258,11 +300,19 @@ impl<'a, T> RawDescriptor<'a, T> {
             .is_ok()
         {
             self.loop_insert(new_descriptor_guard.data);
-            std::mem::drop(new_descriptor_guard);
-            HazPtrHolder::try_reclaim();
-            Ok(())
+            if unsafe { (*new_descriptor_guard.data).success.load(Ordering::Acquire) } {
+                std::mem::drop(new_descriptor_guard);
+                std::mem::drop(current_node_guard);
+                HazPtrHolder::try_reclaim();
+                return SwapResult::Success;
+            } else {
+                std::mem::drop(new_descriptor_guard);
+                std::mem::drop(current_node_guard);
+                HazPtrHolder::try_reclaim();
+                return SwapResult::Failure;
+            }
         } else {
-            Err(())
+            return SwapResult::Failure;
         }
     }
 
@@ -304,7 +354,9 @@ impl<'a, T> RawDescriptor<'a, T> {
         let head_ptr = unsafe { &(*actual_descriptor_guard.data).ptr };
         // we dont check for the head_ptr_guard to be none because we are fine with the head being
         // a null pointer as we are inserting
-        let mut head_ptr_guard = unsafe { head_ptr_holder.load(head_ptr) };
+        let mut head_ptr_guard = unsafe {
+            head_ptr_holder.load(&AtomicPtr::new((*actual_descriptor_guard.data).current))
+        };
         // the logic here is that if a load some other pointer then there can be two scenarios that
         // exist...either i load one which is completely distinct from this descriptor's operation
         // in which case the pending and status fields will prevent us from doing any harm and
@@ -323,32 +375,51 @@ impl<'a, T> RawDescriptor<'a, T> {
         loop {
             match pending.load(Ordering::Acquire) {
                 true => match status.load(Ordering::Acquire) {
-                    0 => {
+                    1 => {
                         Self::insert_head(next, current);
                         // Using store instead of CAS can corrupt the process, assume that the status
                         // has already reached to 2 but there is still a possibility of it being
                         // 1 by other threads who were in the process of helping.
                         status.compare_exchange(0, 1, Ordering::AcqRel, Ordering::Relaxed);
-                        continue;
+                        pending.store(false, Ordering::Release);
+                        break;
                     }
-                    1 => {
-                        // this could work but if current was null and some thread reached
-                        // here...then some other thread completed the operation and the some other
-                        // thread also deleted everything ... again the head ptr is null but once
-                        // this thread resumes it will successfully store the next into the head
-                        // again
-                        head_ptr.compare_exchange(
+                    0 => {
+                        let result = head_ptr.compare_exchange(
                             current,
                             next,
                             Ordering::AcqRel,
                             Ordering::Relaxed,
                         );
-                        pending.store(false, Ordering::Release);
-                        break;
+                        // the issue is that this is going to succeed even if the thing was once
+                        // stored then the thread was preempted and then everything was deleted..
+                        // head_ptr will again be null but the compare and swap will still succeed
+                        // TODO: resolve this issue
+                        if result.is_ok() {
+                            // this can be blocking
+                            unsafe {
+                                (*actual_descriptor_guard.data)
+                                    .success
+                                    .store(true, Ordering::Release);
+                            }
+
+                            status.compare_exchange(0, 1, Ordering::AcqRel, Ordering::Relaxed);
+                            continue;
+                        } else {
+                            pending.store(false, Ordering::Release);
+                        }
+                        if unsafe {
+                            (*actual_descriptor_guard.data)
+                                .success
+                                .load(Ordering::Acquire)
+                        } {
+                            status.compare_exchange(0, 1, Ordering::AcqRel, Ordering::Relaxed);
+                            continue;
+                        } else {
+                            pending.store(false, Ordering::Release);
+                            break;
+                        }
                     }
-                    /*2 => {
-                        continue;
-                    }*/
                     _ => unreachable!(),
                 },
                 false => return,
@@ -388,10 +459,18 @@ impl<'a, T> RawDescriptor<'a, T> {
         tail_ptr: &'a AtomicPtr<Node<T>>,
     ) -> Option<T> {
         loop {
+            let mut current_node_holder = HazPtrHolder::default();
+            let mut current_node_guard = unsafe { current_node_holder.load(tail_ptr) };
+            if current_node_guard.is_none() {
+                return None;
+            }
+            let mut actual_current_node_guard = current_node_guard.expect("Has to be there");
             let uninit = Box::into_raw(Box::new(MaybeUninit::uninit()));
             let new = Box::into_raw(Box::new(Descriptor::new(
                 ptr,
                 tail_ptr,
+                actual_current_node_guard.data,
+                AtomicBool::new(false),
                 std::ptr::null_mut(),
                 AtomicUsize::new(0),
                 AtomicBool::new(true),
@@ -419,29 +498,35 @@ impl<'a, T> RawDescriptor<'a, T> {
                     .is_ok()
                 {
                     self.loop_delete(new_descriptor_guard.data);
-                    // On running tests with Miri, it complains about the possibility of this field getting
-                    // accessed for a  read and a write concurrently as it is a non-atomic type but it is simply
-                    // not possible at runtime because our structure prevents it from happening
-                    if unsafe {
-                        (*new_descriptor_guard.data)
-                            .init_stored
-                            .load(Ordering::Acquire)
-                    } {
-                        let init_ptr = unsafe {
+                    if unsafe { (*new_descriptor_guard.data).success.load(Ordering::Acquire) } {
+                        if unsafe {
                             (*new_descriptor_guard.data)
-                                .taken_value
-                                .swap(std::ptr::null_mut(), Ordering::SeqCst)
-                        };
-                        let owned_init = unsafe { Box::from_raw(init_ptr) };
-                        let taken_value = unsafe { owned_init.assume_init() };
+                                .init_stored
+                                .load(Ordering::Acquire)
+                        } {
+                            let init_ptr = unsafe {
+                                (*new_descriptor_guard.data)
+                                    .taken_value
+                                    .swap(std::ptr::null_mut(), Ordering::SeqCst)
+                            };
+                            let owned_init = unsafe { Box::from_raw(init_ptr) };
+                            let taken_value = unsafe { owned_init.assume_init() };
 
-                        std::mem::drop(new_descriptor_guard);
-                        HazPtrHolder::try_reclaim();
-                        return Some(*taken_value);
+                            std::mem::drop(new_descriptor_guard);
+                            std::mem::drop(actual_current_node_guard);
+                            HazPtrHolder::try_reclaim();
+                            return Some(*taken_value);
+                        } else {
+                            std::mem::drop(new_descriptor_guard);
+                            std::mem::drop(actual_current_node_guard);
+                            HazPtrHolder::try_reclaim();
+                            return None;
+                        }
                     } else {
                         std::mem::drop(new_descriptor_guard);
+                        std::mem::drop(actual_current_node_guard);
                         HazPtrHolder::try_reclaim();
-                        return None;
+                        continue;
                     }
                 }
             } else {
@@ -484,28 +569,39 @@ impl<'a, T> RawDescriptor<'a, T> {
                                 }
                             }
                             self.loop_delete(new);
-                            if unsafe { (*new_guard.data).init_stored.load(Ordering::Acquire) } {
-                                let init_ptr = unsafe {
-                                    (*new_guard.data)
-                                        .taken_value
-                                        .swap(std::ptr::null_mut(), Ordering::SeqCst)
-                                };
-                                let owned_init = unsafe { Box::from_raw(init_ptr) };
-                                let taken_value = unsafe { owned_init.assume_init() };
-                                std::mem::drop(new_guard);
-                                std::mem::drop(descriptor_guard);
-                                HazPtrHolder::try_reclaim();
-                                break Some(*taken_value);
+                            if unsafe { (*new_guard.data).success.load(Ordering::Acquire) } {
+                                if unsafe { (*new_guard.data).init_stored.load(Ordering::Acquire) }
+                                {
+                                    let init_ptr = unsafe {
+                                        (*new_guard.data)
+                                            .taken_value
+                                            .swap(std::ptr::null_mut(), Ordering::SeqCst)
+                                    };
+                                    let owned_init = unsafe { Box::from_raw(init_ptr) };
+                                    let taken_value = unsafe { owned_init.assume_init() };
+                                    std::mem::drop(new_guard);
+                                    std::mem::drop(descriptor_guard);
+                                    std::mem::drop(actual_current_node_guard);
+                                    HazPtrHolder::try_reclaim();
+                                    break Some(*taken_value);
+                                } else {
+                                    std::mem::drop(new_guard);
+                                    std::mem::drop(descriptor_guard);
+                                    std::mem::drop(actual_current_node_guard);
+                                    break None;
+                                }
                             } else {
                                 std::mem::drop(new_guard);
                                 std::mem::drop(descriptor_guard);
-                                break None;
+                                std::mem::drop(actual_current_node_guard);
+                                HazPtrHolder::try_reclaim();
                             }
                         } else {
                             let drop = unsafe { Box::from_raw(new) };
                             std::mem::drop(drop);
                             self.help(thing.data);
                             std::mem::drop(descriptor_guard);
+                            std::mem::drop(actual_current_node_guard);
                             std::mem::drop(new_guard);
                             HazPtrHolder::try_reclaim();
                         }
@@ -514,6 +610,7 @@ impl<'a, T> RawDescriptor<'a, T> {
                         std::mem::drop(drop);
                         self.help(thing.data);
                         std::mem::drop(descriptor_guard);
+                        std::mem::drop(actual_current_node_guard);
                         std::mem::drop(new_guard);
                         HazPtrHolder::try_reclaim();
                     }
@@ -532,11 +629,23 @@ impl<'a, T> RawDescriptor<'a, T> {
         let actual_descriptor_guard = descriptor_guard.expect("Has to be there");
         let tail_ptr = unsafe { &(*actual_descriptor_guard.data).tail_ptr };
         let mut tail_ptr_holder = HazPtrHolder::default();
-        let mut tail_ptr_guard = unsafe { tail_ptr_holder.load(tail_ptr) };
+        // load the current from the descriptor and not directly from the pointer
+        let mut tail_ptr_guard = unsafe {
+            tail_ptr_holder.load(&AtomicPtr::new((*actual_descriptor_guard.data).current))
+        };
         if tail_ptr_guard.is_none() {
             return;
         }
         let actual_tail_ptr_guard = tail_ptr_guard.expect("Has to be there");
+        //let prev_ptr = unsafe {(*actual_tail_ptr_guard.data).prev.load(Ordering::Acquire)};
+        let mut prev_ptr_holder = HazPtrHolder::default();
+        let mut prev_ptr_guard =
+            unsafe { prev_ptr_holder.load(&(*actual_tail_ptr_guard.data).prev) };
+        let prev = if let Some(ref mut guard) = prev_ptr_guard {
+            guard.data
+        } else {
+            std::ptr::null_mut()
+        };
         let mut head_ptr_holder = HazPtrHolder::default();
         let head_ptr = unsafe { &(*actual_descriptor_guard.data).ptr };
         let mut head_ptr_guard = unsafe { head_ptr_holder.load(head_ptr) };
@@ -554,9 +663,7 @@ impl<'a, T> RawDescriptor<'a, T> {
         loop {
             match pending.load(Ordering::Acquire) {
                 true => match status.load(Ordering::Acquire) {
-                    0 => {
-                        let prev =
-                            unsafe { (*actual_tail_ptr_guard.data).prev.load(Ordering::Acquire) };
+                    1 => {
                         if prev.is_null() {
                             head_ptr.compare_exchange(
                                 actual_tail_ptr_guard.data,
@@ -566,11 +673,10 @@ impl<'a, T> RawDescriptor<'a, T> {
                             );
                         }
 
-                        status.compare_exchange(0, 1, Ordering::AcqRel, Ordering::Relaxed);
+                        status.compare_exchange(1, 2, Ordering::AcqRel, Ordering::Relaxed);
                         continue;
                     }
-                    1 => {
-                        println!("Giving out value");
+                    2 => {
                         let taken_value =
                             unsafe { std::ptr::read(&(*actual_tail_ptr_guard.data).value) };
                         let mut init = MaybeUninit::uninit();
@@ -584,19 +690,6 @@ impl<'a, T> RawDescriptor<'a, T> {
                                 .init_stored
                                 .store(true, Ordering::Release);
                         }
-                        status.compare_exchange(1, 2, Ordering::AcqRel, Ordering::Relaxed);
-                        continue;
-                    }
-                    2 => {
-                        let prev =
-                            unsafe { (*actual_tail_ptr_guard.data).prev.load(Ordering::Acquire) };
-                        //status.compare_exchange(2, 3, Ordering::AcqRel, Ordering::Relaxed);
-                        tail_ptr.compare_exchange(
-                            actual_tail_ptr_guard.data,
-                            prev,
-                            Ordering::AcqRel,
-                            Ordering::Relaxed,
-                        );
                         if unsafe {
                             (*actual_tail_ptr_guard)
                                 .retired
@@ -617,6 +710,47 @@ impl<'a, T> RawDescriptor<'a, T> {
                         }
                         pending.store(false, Ordering::Release);
                         break;
+                    }
+                    0 => {
+                        //status.compare_exchange(2, 3, Ordering::AcqRel, Ordering::Relaxed);
+                        let result = tail_ptr.compare_exchange(
+                            actual_tail_ptr_guard.data,
+                            prev,
+                            Ordering::AcqRel,
+                            Ordering::Relaxed,
+                        );
+                        if result.is_ok() {
+                            // this itself is blocking
+                            unsafe {
+                                (*actual_descriptor_guard.data)
+                                    .success
+                                    .store(true, Ordering::Release)
+                            }
+                            status.compare_exchange(0, 1, Ordering::AcqRel, Ordering::Relaxed);
+                            continue;
+                        } else {
+                            pending.store(false, Ordering::Release);
+                            break;
+                        }
+                        // if a thread reaches it is possible that some other thread managed to do
+                        // the compare and exchange stored the success in the descriptor and then
+                        // got preempted or it is also possible that it got prempted just after the
+                        // compare and swap... both of these cases can create a deadlock and we
+                        // have to guard against both of them...
+                        if unsafe {
+                            (*actual_descriptor_guard.data)
+                                .success
+                                .load(Ordering::Acquire)
+                        } {
+                            status.compare_exchange(0, 1, Ordering::AcqRel, Ordering::Relaxed);
+                            continue;
+                        } else {
+                            pending.store(false, Ordering::Release);
+                            break;
+                        }
+                        // how do i make sure that even when the CAS succeded and the thread got
+                        // prempted... we continue the operation...same goes for the loop insert
+                        // method
                     }
                     _ => unreachable!(),
                 },
