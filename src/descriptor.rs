@@ -200,7 +200,7 @@ impl<'a, T> RawDescriptor<'a, T> {
                                 thing.data,
                                 new_descriptor,
                                 Ordering::AcqRel,
-                                Ordering::Relaxed,
+                                Ordering::Acquire,
                             )
                             .is_ok()
                         {
@@ -227,7 +227,7 @@ impl<'a, T> RawDescriptor<'a, T> {
                                             false,
                                             true,
                                             Ordering::AcqRel,
-                                            Ordering::Relaxed,
+                                            Ordering::Acquire,
                                         )
                                         .is_ok()
                                 } {
@@ -295,7 +295,7 @@ impl<'a, T> RawDescriptor<'a, T> {
                 std::ptr::null_mut(),
                 new_descriptor_guard.data,
                 Ordering::AcqRel,
-                Ordering::Relaxed,
+                Ordering::Acquire,
             )
             .is_ok()
         {
@@ -473,7 +473,7 @@ impl<'a, T> RawDescriptor<'a, T> {
                         std::ptr::null_mut(),
                         new,
                         Ordering::AcqRel,
-                        Ordering::Relaxed,
+                        Ordering::Acquire,
                     )
                     .is_ok()
                 {
@@ -522,7 +522,7 @@ impl<'a, T> RawDescriptor<'a, T> {
                     if unsafe { !(*thing.data).pending.load(Ordering::Acquire) } {
                         if self
                             .descriptor
-                            .compare_exchange(thing.data, new, Ordering::AcqRel, Ordering::Relaxed)
+                            .compare_exchange(thing.data, new, Ordering::AcqRel, Ordering::Acquire)
                             .is_ok()
                         {
                             let mut swap_holder = HazPtrHolder::default();
@@ -541,7 +541,7 @@ impl<'a, T> RawDescriptor<'a, T> {
                                             false,
                                             true,
                                             Ordering::AcqRel,
-                                            Ordering::Relaxed,
+                                            Ordering::Acquire,
                                         )
                                         .is_ok()
                                 } {
@@ -600,12 +600,14 @@ impl<'a, T> RawDescriptor<'a, T> {
     }
 
     fn loop_delete(&self, current_descriptor: *mut Descriptor<'a, T>) {
+        println!("a");
         let mut descriptor_holder = HazPtrHolder::default();
         let mut descriptor_guard =
             unsafe { descriptor_holder.load(&AtomicPtr::new(current_descriptor)) };
         if descriptor_guard.is_none() {
             return;
         }
+        //println!("dg");
         let actual_descriptor_guard = descriptor_guard.expect("Has to be there");
         let tail_ptr = unsafe { &(*actual_descriptor_guard.data).tail_ptr };
         let mut tail_ptr_holder = HazPtrHolder::default();
@@ -616,6 +618,7 @@ impl<'a, T> RawDescriptor<'a, T> {
         if tail_ptr_guard.is_none() {
             return;
         }
+        //println!("tg");
         let actual_tail_ptr_guard = tail_ptr_guard.expect("Has to be there");
         //let prev_ptr = unsafe {(*actual_tail_ptr_guard.data).prev.load(Ordering::Acquire)};
         let mut prev_ptr_holder = HazPtrHolder::default();
@@ -632,6 +635,7 @@ impl<'a, T> RawDescriptor<'a, T> {
         if head_ptr_guard.is_none() {
             return;
         }
+        //println!("hg");
         let pending = unsafe { &(*actual_descriptor_guard.data).pending };
         let status = unsafe { &(*actual_descriptor_guard.data).status };
         // the idea is that the pending and status field combine with the storing of status number
@@ -677,6 +681,7 @@ impl<'a, T> RawDescriptor<'a, T> {
                         break;
                     }
                     1 => {
+                        //println!("a");
                         let taken_value =
                             unsafe { std::ptr::read(&(*actual_tail_ptr_guard.data).value) };
                         let mut init = MaybeUninit::uninit();
@@ -699,6 +704,7 @@ impl<'a, T> RawDescriptor<'a, T> {
                         // therefore... helper threads will help when required and will just
                         // instantly return when helping is not required or when pointer that we
                         // expected to be stored into the tail_ptr is not actually there
+                        //println!("0");
                         if current != actual_tail_ptr_guard.data {
                             pending.store(false, Ordering::Release);
                             break;
@@ -708,10 +714,11 @@ impl<'a, T> RawDescriptor<'a, T> {
                                 actual_tail_ptr_guard.data,
                                 std::ptr::null_mut(),
                                 Ordering::AcqRel,
-                                Ordering::Relaxed,
+                                Ordering::Acquire,
                             );
                         }
-                        status.compare_exchange(0, 1, Ordering::AcqRel, Ordering::Relaxed);
+                        //println!("hgswap");
+                        status.compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire);
                         continue;
                     }
                     _ => unreachable!(),

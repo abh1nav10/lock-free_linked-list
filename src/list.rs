@@ -97,8 +97,10 @@ impl<T> LinkedList<T> {
 #[cfg(test)]
 mod test {
     use super::*;
+    use std::time::Instant;
     #[test]
     fn test_one() {
+        let current = Instant::now();
         let new = &LinkedList::new();
         let raw = &RawDescriptor::new();
         std::thread::scope(|s| {
@@ -115,7 +117,8 @@ mod test {
                 });
             }
         });
-        let len = new.length();
-        assert_eq!(0 as usize, len);
+        assert_eq!(0 as usize, new.length());
+        let time_taken = current.elapsed();
+        println!("{:?}", time_taken.as_micros());
     }
 }
