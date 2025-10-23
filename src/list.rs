@@ -46,13 +46,13 @@ impl<T> LinkedList<T> {
     pub fn insert_from_head<'a>(&'a self, value: T, raw_descriptor: &RawDescriptor<'a, T>) {
         let boxed = Box::into_raw(Box::new(Node::new(value)));
         loop {
-            let current = self.head.load(Ordering::Acquire);
+            let current = self.head.load(Ordering::SeqCst);
             if current.is_null() {
                 match self.head.compare_exchange(
                     std::ptr::null_mut(),
                     boxed,
-                    Ordering::AcqRel,
-                    Ordering::Relaxed,
+                    Ordering::SeqCst,
+                    Ordering::SeqCst,
                 ) {
                     Ok(_) => {
                         // We dont CAS the tail because we dont have a method to insert from the
@@ -62,9 +62,9 @@ impl<T> LinkedList<T> {
                         // Updating the tail is the only reason we have this loop in the first
                         // place otherwise the insert method has got all the capability to handle
                         // the case where head is an atomic pointer storing a null pointer.
-                        self.tail.store(boxed, Ordering::Release);
+                        self.tail.store(boxed, Ordering::SeqCst);
                         println!("Reached insert");
-                        self.length.fetch_add(1, Ordering::Relaxed);
+                        self.length.fetch_add(1, Ordering::SeqCst);
                         break;
                     }
                     Err(_) => {
@@ -74,7 +74,7 @@ impl<T> LinkedList<T> {
             } else {
                 raw_descriptor.insert(&self.head, &self.tail, boxed);
                 println!("Reached insert");
-                self.length.fetch_add(1, Ordering::Relaxed);
+                self.length.fetch_add(1, Ordering::SeqCst);
                 break;
             }
         }
@@ -84,7 +84,7 @@ impl<T> LinkedList<T> {
         let ret = raw_descriptor.delete(&self.head, &self.tail);
         if ret.is_some() {
             println!("Reached decrement subcount");
-            self.length.fetch_sub(1, Ordering::Relaxed);
+            self.length.fetch_sub(1, Ordering::SeqCst);
         }
         return ret;
     }
