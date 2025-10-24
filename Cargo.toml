@@ -1,6 +1,13 @@
 [package]
-name = "fastlist"
+name = "ruby"
 version = "0.1.0"
 edition = "2024"
+authors = ["Abhinav"]
 
 [dependencies]
+
+
+[target.'cfg(loom)'.dependencies]
+loom = "0.7"
+
+

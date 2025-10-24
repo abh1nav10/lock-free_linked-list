@@ -1,11 +1,13 @@
+#![allow(unexpected_cfgs)]
+use crate::sync::atomic::{AtomicBool, AtomicPtr};
 use std::collections::HashSet;
 use std::convert::AsRef;
 use std::marker::PhantomData;
 use std::ops::{Deref, DerefMut};
 use std::ptr::NonNull;
 use std::sync::atomic::Ordering;
-use std::sync::atomic::{AtomicBool, AtomicPtr};
 
+#[cfg(not(loom))]
 pub(crate) static SHARED_DOMAIN: HazPtrDomain = HazPtrDomain {
     list: HazPtrs {
         head: AtomicPtr::new(std::ptr::null_mut()),
@@ -14,6 +16,18 @@ pub(crate) static SHARED_DOMAIN: HazPtrDomain = HazPtrDomain {
         head: AtomicPtr::new(std::ptr::null_mut()),
     },
 };
+
+#[cfg(loom)]
+loom::lazy_static! {
+    static ref SHARED_DOMAIN: HazPtrDomain = HazPtrDomain {
+        list: HazPtrs {
+            head: AtomicPtr::new(std::ptr::null_mut()),
+        },
+        ret: Retired {
+            head: AtomicPtr::new(std::ptr::null_mut()),
+        },
+    };
+}
 
 #[derive(Default)]
 pub struct HazPtrHolder(Option<&'static HazPtr>);
@@ -167,7 +181,7 @@ impl HazPtr {
     }
 }
 
-pub(crate) trait HazPtrObject {
+pub trait HazPtrObject {
     fn domain<'a>(&'a self) -> &'a HazPtrDomain;
     fn retire(&mut self);
 }
@@ -470,43 +484,5 @@ impl Retired {
                 }
             }
         }
-    }
-}
-
-#[cfg(test)]
-mod test {
-    use super::*;
-    use std::sync::Arc;
-    use std::sync::atomic::AtomicUsize;
-    struct CountDrops(Arc<AtomicUsize>);
-    impl Drop for CountDrops {
-        fn drop(&mut self) {
-            self.0.fetch_add(1, Ordering::Relaxed);
-        }
-    }
-    impl CountDrops {
-        fn get_number_of_drops(&self) -> usize {
-            self.0.load(Ordering::Relaxed)
-        }
-    }
-    #[test]
-    fn test() {
-        let new = Arc::new(AtomicUsize::new(0));
-        let check = CountDrops(new.clone());
-        let value1 = CountDrops(new.clone());
-        let value2 = CountDrops(new.clone());
-        let boxed1 = Box::into_raw(Box::new(value1));
-        let boxed2 = Box::into_raw(Box::new(value2));
-        let atm_ptr = AtomicPtr::new(boxed1);
-        let mut holder = HazPtrHolder::default();
-        let guard = unsafe { holder.load(&atm_ptr) };
-        static DROPBOX: DropBox = DropBox::new();
-        std::mem::drop(guard);
-        if let Some(mut wrapper) = unsafe { holder.swap(&atm_ptr, boxed2, &DROPBOX) } {
-            wrapper.retire();
-        }
-        assert_eq!(check.get_number_of_drops(), 1 as usize);
-        let _ = unsafe { Box::from_raw(boxed2) };
-        std::mem::drop(check);
     }
 }

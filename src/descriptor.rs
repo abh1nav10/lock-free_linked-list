@@ -2,11 +2,11 @@
 #![allow(unused_must_use)]
 #![allow(unused)]
 use crate::Node;
+use crate::sync::atomic::{AtomicBool, AtomicPtr, AtomicUsize};
 use crate::{Deleter, DropBox, DropPointer, HazPtrHolder, HazPtrObject};
 use std::mem::MaybeUninit;
 use std::ops::DerefMut;
 use std::sync::atomic::Ordering;
-use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicUsize};
 
 static DELETER1: DropBox = DropBox::new();
 static DELETER2: DropPointer = DropPointer::new();
@@ -61,7 +61,7 @@ unsafe impl<'a, T> Sync for Descriptor<'a, T> where T: Send {}
 // and one for deletion through tail. No other raw descriptors will be created as that would
 // violate the safety requirements. It most likely will corrupt our list and in many ways can
 // cause undefined behaviour.
-pub(crate) struct RawDescriptor<'a, T> {
+pub struct RawDescriptor<'a, T> {
     descriptor: AtomicPtr<Descriptor<'a, T>>,
 }
 
@@ -142,7 +142,7 @@ impl<'a, T> RawDescriptor<'a, T> {
 }
 
 impl<'a, T> RawDescriptor<'a, T> {
-    pub fn insert(
+    pub(crate) fn insert(
         &self,
         ptr: &'a AtomicPtr<Node<T>>,
         ptr_tail: &'a AtomicPtr<Node<T>>,
@@ -432,7 +432,7 @@ impl<'a, T> RawDescriptor<'a, T> {
         }
     }
 
-    pub fn delete(
+    pub(crate) fn delete(
         &self,
         ptr: &'a AtomicPtr<Node<T>>,
         tail_ptr: &'a AtomicPtr<Node<T>>,

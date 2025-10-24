@@ -1,9 +1,10 @@
-mod descriptor;
-mod hazard;
-mod list;
+pub mod descriptor;
+pub mod hazard;
+pub mod list;
+pub mod sync;
 
-use crate::hazard::HazPtrObject;
-pub use crate::hazard::{Deleter, DropBox, DropPointer, HazPtrHolder, Retired};
+use crate::hazard::{Deleter, HazPtrObject};
+pub use crate::hazard::{DropBox, DropPointer, HazPtrHolder};
 
 use crate::descriptor::RawDescriptor;
 use crate::list::Node;

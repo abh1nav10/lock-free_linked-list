@@ -1,8 +1,8 @@
 #![allow(dead_code)]
 use crate::RawDescriptor;
+use crate::sync::atomic::{AtomicBool, AtomicPtr, AtomicUsize};
 use std::marker::PhantomData;
 use std::sync::atomic::Ordering;
-use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicUsize};
 
 pub(crate) struct Node<T> {
     pub(crate) value: T,
@@ -91,34 +91,5 @@ impl<T> LinkedList<T> {
 
     pub fn length(&self) -> usize {
         self.length.load(Ordering::Relaxed)
-    }
-}
-
-#[cfg(test)]
-mod test {
-    use super::*;
-    use std::time::Instant;
-    #[test]
-    fn test_one() {
-        let current = Instant::now();
-        let new = &LinkedList::new();
-        let raw = &RawDescriptor::new();
-        std::thread::scope(|s| {
-            for i in 0..10 {
-                s.spawn(move || {
-                    new.insert_from_head(i, &raw);
-                });
-            }
-        });
-        std::thread::scope(|s| {
-            for _ in 0..10 {
-                s.spawn(move || {
-                    let _ = new.delete_from_tail(&raw);
-                });
-            }
-        });
-        assert_eq!(0 as usize, new.length());
-        let time_taken = current.elapsed();
-        println!("{:?}", time_taken.as_micros());
     }
 }
