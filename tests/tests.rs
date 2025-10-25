@@ -1,24 +1,22 @@
 #[cfg(test)]
 mod queue_test {
-    use ruby::descriptor::RawDescriptor;
     use ruby::list::LinkedList;
     use std::time::Instant;
     #[test]
     fn test_one() {
         let current = Instant::now();
         let new = &LinkedList::new();
-        let raw = &RawDescriptor::new(new);
         std::thread::scope(|s| {
             for i in 0..10 {
                 s.spawn(move || {
-                    new.insert_from_head(i, &raw);
+                    new.insert_from_head(i);
                 });
             }
         });
         std::thread::scope(|s| {
             for _ in 0..10 {
                 s.spawn(move || {
-                    let _ = new.delete_from_tail(&raw);
+                    let _ = new.delete_from_tail();
                 });
             }
         });

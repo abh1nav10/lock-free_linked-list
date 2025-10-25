@@ -1,5 +1,5 @@
 #![allow(dead_code)]
-use crate::RawDescriptor;
+use crate::Descriptor;
 use crate::sync::atomic::{AtomicBool, AtomicPtr, AtomicUsize};
 use std::marker::PhantomData;
 use std::sync::atomic::Ordering;
@@ -27,6 +27,7 @@ pub struct LinkedList<T> {
     length: AtomicUsize,
     pub(crate) head: AtomicPtr<Node<T>>,
     pub(crate) tail: AtomicPtr<Node<T>>,
+    pub(crate) descriptor: AtomicPtr<Descriptor<T>>,
     marker: PhantomData<Node<T>>,
 }
 
@@ -39,11 +40,12 @@ impl<T> LinkedList<T> {
             length: AtomicUsize::new(0),
             head: AtomicPtr::new(std::ptr::null_mut()),
             tail: AtomicPtr::new(std::ptr::null_mut()),
+            descriptor: AtomicPtr::new(std::ptr::null_mut()),
             marker: PhantomData,
         }
     }
 
-    pub fn insert_from_head<'a>(&self, value: T, raw_descriptor: &RawDescriptor<'a, T>) {
+    pub fn insert_from_head<'a>(&self, value: T) {
         let boxed = Box::into_raw(Box::new(Node::new(value)));
         loop {
             let current = self.head.load(Ordering::SeqCst);
@@ -72,7 +74,7 @@ impl<T> LinkedList<T> {
                     }
                 }
             } else {
-                raw_descriptor.insert(boxed);
+                self.insert(boxed);
                 println!("Reached insert");
                 self.length.fetch_add(1, Ordering::SeqCst);
                 break;
@@ -80,8 +82,8 @@ impl<T> LinkedList<T> {
         }
     }
 
-    pub fn delete_from_tail<'a>(&self, raw_descriptor: &RawDescriptor<'a, T>) -> Option<T> {
-        let ret = raw_descriptor.delete();
+    pub fn delete_from_tail<'a>(&self) -> Option<T> {
+        let ret = self.delete();
         if ret.is_some() {
             println!("Reached decrement subcount");
             self.length.fetch_sub(1, Ordering::SeqCst);

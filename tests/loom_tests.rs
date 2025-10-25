@@ -3,23 +3,19 @@
 #[cfg(test)]
 #[cfg(loom)]
 mod loom_tests {
-    use ruby::descriptor::RawDescriptor;
+    use loom::sync::Arc;
     use ruby::list::LinkedList;
-    use std::sync::Arc;
     #[test]
     fn concurrency_test() {
         loom::model(|| {
             let new = Arc::new(LinkedList::new());
-            let raw_descriptor = Arc::new(RawDescriptor::new(&new));
             let cloned1 = Arc::clone(&new);
             let cloned2 = Arc::clone(&new);
-            let raw_cloned1 = Arc::clone(&raw_descriptor);
-            let raw_cloned2 = Arc::clone(&raw_descriptor);
             let t1 = loom::thread::spawn(move || {
-                cloned1.insert_from_head(2, &raw_cloned1);
+                cloned1.insert_from_head(2);
             });
             let t2 = loom::thread::spawn(move || {
-                let _ = cloned2.delete_from_tail(&raw_cloned2);
+                let _ = cloned2.delete_from_tail();
             });
             t1.join().unwrap();
             t2.join().unwrap();

@@ -55,21 +55,7 @@ enum SwapResult {
 unsafe impl<T> Send for Descriptor<T> where T: Send {}
 unsafe impl<T> Sync for Descriptor<T> where T: Send {}
 
-// The linked list based FIFO queue will have two raw descriptors, one for insertion through head
-// and one for deletion through tail. No other raw descriptors will be created as that would
-// violate the safety requirements. It most likely will corrupt our list and in many ways can
-// cause undefined behaviour.
-pub struct RawDescriptor<'a, T> {
-    descriptor: AtomicPtr<Descriptor<T>>,
-    head_ptr: &'a AtomicPtr<Node<T>>,
-    tail_ptr: &'a AtomicPtr<Node<T>>,
-}
-
-// not required as it is auto implemented but i am doing it for clarity purposes
-unsafe impl<'a, T> Send for RawDescriptor<'a, T> where T: Send {}
-unsafe impl<'a, T> Sync for RawDescriptor<'a, T> where T: Sync {}
-
-impl<'a, T> Drop for RawDescriptor<'a, T> {
+impl<T> Drop for LinkedList<T> {
     fn drop(&mut self) {
         let mut holder = HazPtrHolder::default();
         let mut guard = unsafe { holder.load(&self.descriptor) };
@@ -129,21 +115,11 @@ impl<T> Descriptor<T> {
     }
 }
 
-impl<'a, T> RawDescriptor<'a, T> {
-    pub fn new(list: &'a LinkedList<T>) -> Self {
-        Self {
-            descriptor: AtomicPtr::new(std::ptr::null_mut()),
-            head_ptr: &list.head,
-            tail_ptr: &list.tail,
-        }
-    }
-}
-
-impl<'a, T> RawDescriptor<'a, T> {
+impl<T> LinkedList<T> {
     pub(crate) fn insert(&self, next: *mut Node<T>) {
         loop {
             let mut current_node_holder = HazPtrHolder::default();
-            let mut current_node_guard = unsafe { current_node_holder.load(self.head_ptr) };
+            let mut current_node_guard = unsafe { current_node_holder.load(&self.head) };
             let current_node = if let Some(ref mut guard) = current_node_guard {
                 guard.data
             } else {
@@ -345,7 +321,7 @@ impl<'a, T> RawDescriptor<'a, T> {
         let mut next_ptr_holder = HazPtrHolder::default();
         let mut next_ptr_guard = unsafe { next_ptr_holder.load(&AtomicPtr::new(next)) };
         let mut head_ptr_holder = HazPtrHolder::default();
-        let head_ptr = self.head_ptr;
+        let head_ptr = &self.head;
         // we dont check for the head_ptr_guard to be none because we are fine with the head being
         // a null pointer as we are inserting
         let mut head_ptr_guard = unsafe {
@@ -426,7 +402,7 @@ impl<'a, T> RawDescriptor<'a, T> {
     pub(crate) fn delete(&self) -> Option<T> {
         loop {
             let mut current_node_holder = HazPtrHolder::default();
-            let mut current_node_guard = unsafe { current_node_holder.load(self.tail_ptr) };
+            let mut current_node_guard = unsafe { current_node_holder.load(&self.tail) };
             if current_node_guard.is_none() {
                 println!("should not be printed for the current test case");
                 return None;
@@ -595,7 +571,7 @@ impl<'a, T> RawDescriptor<'a, T> {
         }
         //println!("dg");
         let actual_descriptor_guard = descriptor_guard.expect("Has to be there");
-        let tail_ptr = self.tail_ptr;
+        let tail_ptr = &self.tail;
         let mut tail_ptr_holder = HazPtrHolder::default();
         // load the current from the descriptor and not directly from the pointer
         let mut tail_ptr_guard = unsafe {
@@ -621,7 +597,7 @@ impl<'a, T> RawDescriptor<'a, T> {
             std::ptr::null_mut()
         };
         let mut head_ptr_holder = HazPtrHolder::default();
-        let head_ptr = self.head_ptr;
+        let head_ptr = &self.head;
         let mut head_ptr_guard = unsafe { head_ptr_holder.load(head_ptr) };
         if head_ptr_guard.is_none() {
             // store false in the pending field of the descriptor...as there is a possibility of
