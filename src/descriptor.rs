@@ -1,9 +1,9 @@
 #![allow(dead_code)]
 #![allow(unused_must_use)]
 #![allow(unused)]
-use crate::Node;
 use crate::sync::atomic::{AtomicBool, AtomicPtr, AtomicUsize};
 use crate::{Deleter, DropBox, DropPointer, HazPtrHolder, HazPtrObject};
+use crate::{LinkedList, Node};
 use std::mem::MaybeUninit;
 use std::ops::DerefMut;
 use std::sync::atomic::Ordering;
@@ -26,9 +26,7 @@ pub(crate) enum Operation {
 // false again into the pending field which would allow other threads to swap the
 // descriptor field in the raw dexcriptor again. Thus we have to prevent this by using
 // AtomicUsize here as well.
-pub(crate) struct Descriptor<'a, T> {
-    ptr: &'a AtomicPtr<Node<T>>,
-    tail_ptr: &'a AtomicPtr<Node<T>>,
+pub(crate) struct Descriptor<T> {
     current: *mut Node<T>, // newest change to solve the biggest problems
     success: AtomicBool,
     next: *mut Node<T>,
@@ -54,15 +52,17 @@ enum SwapResult {
     Failure,
 }
 
-unsafe impl<'a, T> Send for Descriptor<'a, T> where T: Send {}
-unsafe impl<'a, T> Sync for Descriptor<'a, T> where T: Send {}
+unsafe impl<T> Send for Descriptor<T> where T: Send {}
+unsafe impl<T> Sync for Descriptor<T> where T: Send {}
 
 // The linked list based FIFO queue will have two raw descriptors, one for insertion through head
 // and one for deletion through tail. No other raw descriptors will be created as that would
 // violate the safety requirements. It most likely will corrupt our list and in many ways can
 // cause undefined behaviour.
 pub struct RawDescriptor<'a, T> {
-    descriptor: AtomicPtr<Descriptor<'a, T>>,
+    descriptor: AtomicPtr<Descriptor<T>>,
+    head_ptr: &'a AtomicPtr<Node<T>>,
+    tail_ptr: &'a AtomicPtr<Node<T>>,
 }
 
 // not required as it is auto implemented but i am doing it for clarity purposes
@@ -101,10 +101,8 @@ impl<'a, T> Drop for RawDescriptor<'a, T> {
     }
 }
 
-impl<'a, T> Descriptor<'a, T> {
+impl<T> Descriptor<T> {
     fn new(
-        ptr: &'a AtomicPtr<Node<T>>,
-        tail_ptr: &'a AtomicPtr<Node<T>>,
         current: *mut Node<T>,
         success: AtomicBool,
         next: *mut Node<T>,
@@ -117,8 +115,6 @@ impl<'a, T> Descriptor<'a, T> {
         init_stored: AtomicBool,
     ) -> Self {
         Self {
-            ptr,
-            tail_ptr,
             current,
             success,
             next,
@@ -134,32 +130,27 @@ impl<'a, T> Descriptor<'a, T> {
 }
 
 impl<'a, T> RawDescriptor<'a, T> {
-    pub fn new() -> Self {
+    pub fn new(list: &'a LinkedList<T>) -> Self {
         Self {
             descriptor: AtomicPtr::new(std::ptr::null_mut()),
+            head_ptr: &list.head,
+            tail_ptr: &list.tail,
         }
     }
 }
 
 impl<'a, T> RawDescriptor<'a, T> {
-    pub(crate) fn insert(
-        &self,
-        ptr: &'a AtomicPtr<Node<T>>,
-        ptr_tail: &'a AtomicPtr<Node<T>>,
-        next: *mut Node<T>,
-    ) {
+    pub(crate) fn insert(&self, next: *mut Node<T>) {
         loop {
             let mut current_node_holder = HazPtrHolder::default();
-            let mut current_node_guard = unsafe { current_node_holder.load(ptr) };
+            let mut current_node_guard = unsafe { current_node_holder.load(self.head_ptr) };
             let current_node = if let Some(ref mut guard) = current_node_guard {
                 guard.data
             } else {
                 std::ptr::null_mut()
             };
             let uninit = Box::into_raw(Box::new(MaybeUninit::uninit()));
-            let new_descriptor: *mut Descriptor<'a, T> = Box::into_raw(Box::new(Descriptor::new(
-                ptr,
-                ptr_tail,
+            let new_descriptor: *mut Descriptor<T> = Box::into_raw(Box::new(Descriptor::new(
                 current_node,
                 AtomicBool::new(false),
                 next,
@@ -275,7 +266,7 @@ impl<'a, T> RawDescriptor<'a, T> {
     // The function tries to compare and exchange expecting a null pointer which if succeeds we
     // initiate the recurive call and if fails we move forward to see if there is anyone we can
     // help before looping back.
-    fn swap_null_insert(&self, new_descriptor: *mut Descriptor<'a, T>) -> SwapResult {
+    fn swap_null_insert(&self, new_descriptor: *mut Descriptor<T>) -> SwapResult {
         let mut new_descriptor_holder = HazPtrHolder::default();
         let mut new_descriptor_guard = unsafe {
             new_descriptor_holder
@@ -314,7 +305,7 @@ impl<'a, T> RawDescriptor<'a, T> {
         }
     }
 
-    fn help(&self, current_descriptor: *mut Descriptor<'a, T>) {
+    fn help(&self, current_descriptor: *mut Descriptor<T>) {
         let mut holder = HazPtrHolder::default();
         let mut guard = unsafe { holder.load(&AtomicPtr::new(current_descriptor)) };
         if guard.is_none() {
@@ -334,7 +325,7 @@ impl<'a, T> RawDescriptor<'a, T> {
 
     // note down later why the recursive approach did not work and had to switch to loop based
     // approach
-    fn loop_insert(&self, current_descriptor: *mut Descriptor<'a, T>) {
+    fn loop_insert(&self, current_descriptor: *mut Descriptor<T>) {
         let mut descriptor_holder = HazPtrHolder::default();
         let mut descriptor_guard =
             unsafe { descriptor_holder.load(&AtomicPtr::new(current_descriptor)) };
@@ -354,7 +345,7 @@ impl<'a, T> RawDescriptor<'a, T> {
         let mut next_ptr_holder = HazPtrHolder::default();
         let mut next_ptr_guard = unsafe { next_ptr_holder.load(&AtomicPtr::new(next)) };
         let mut head_ptr_holder = HazPtrHolder::default();
-        let head_ptr = unsafe { &(*actual_descriptor_guard.data).ptr };
+        let head_ptr = self.head_ptr;
         // we dont check for the head_ptr_guard to be none because we are fine with the head being
         // a null pointer as we are inserting
         let mut head_ptr_guard = unsafe {
@@ -432,14 +423,10 @@ impl<'a, T> RawDescriptor<'a, T> {
         }
     }
 
-    pub(crate) fn delete(
-        &self,
-        ptr: &'a AtomicPtr<Node<T>>,
-        tail_ptr: &'a AtomicPtr<Node<T>>,
-    ) -> Option<T> {
+    pub(crate) fn delete(&self) -> Option<T> {
         loop {
             let mut current_node_holder = HazPtrHolder::default();
-            let mut current_node_guard = unsafe { current_node_holder.load(tail_ptr) };
+            let mut current_node_guard = unsafe { current_node_holder.load(self.tail_ptr) };
             if current_node_guard.is_none() {
                 println!("should not be printed for the current test case");
                 return None;
@@ -447,8 +434,6 @@ impl<'a, T> RawDescriptor<'a, T> {
             let mut actual_current_node_guard = current_node_guard.expect("Has to be there");
             let uninit = Box::into_raw(Box::new(MaybeUninit::uninit()));
             let new = Box::into_raw(Box::new(Descriptor::new(
-                ptr,
-                tail_ptr,
                 actual_current_node_guard.data,
                 AtomicBool::new(false),
                 std::ptr::null_mut(),
@@ -600,7 +585,7 @@ impl<'a, T> RawDescriptor<'a, T> {
         }
     }
 
-    fn loop_delete(&self, current_descriptor: *mut Descriptor<'a, T>) {
+    fn loop_delete(&self, current_descriptor: *mut Descriptor<T>) {
         println!("a");
         let mut descriptor_holder = HazPtrHolder::default();
         let mut descriptor_guard =
@@ -610,7 +595,7 @@ impl<'a, T> RawDescriptor<'a, T> {
         }
         //println!("dg");
         let actual_descriptor_guard = descriptor_guard.expect("Has to be there");
-        let tail_ptr = unsafe { &(*actual_descriptor_guard.data).tail_ptr };
+        let tail_ptr = self.tail_ptr;
         let mut tail_ptr_holder = HazPtrHolder::default();
         // load the current from the descriptor and not directly from the pointer
         let mut tail_ptr_guard = unsafe {
@@ -636,7 +621,7 @@ impl<'a, T> RawDescriptor<'a, T> {
             std::ptr::null_mut()
         };
         let mut head_ptr_holder = HazPtrHolder::default();
-        let head_ptr = unsafe { &(*actual_descriptor_guard.data).ptr };
+        let head_ptr = self.head_ptr;
         let mut head_ptr_guard = unsafe { head_ptr_holder.load(head_ptr) };
         if head_ptr_guard.is_none() {
             // store false in the pending field of the descriptor...as there is a possibility of

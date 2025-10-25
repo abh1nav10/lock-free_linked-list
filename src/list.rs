@@ -25,8 +25,8 @@ impl<T> Node<T> {
 
 pub struct LinkedList<T> {
     length: AtomicUsize,
-    head: AtomicPtr<Node<T>>,
-    tail: AtomicPtr<Node<T>>,
+    pub(crate) head: AtomicPtr<Node<T>>,
+    pub(crate) tail: AtomicPtr<Node<T>>,
     marker: PhantomData<Node<T>>,
 }
 
@@ -43,7 +43,7 @@ impl<T> LinkedList<T> {
         }
     }
 
-    pub fn insert_from_head<'a>(&'a self, value: T, raw_descriptor: &RawDescriptor<'a, T>) {
+    pub fn insert_from_head<'a>(&self, value: T, raw_descriptor: &RawDescriptor<'a, T>) {
         let boxed = Box::into_raw(Box::new(Node::new(value)));
         loop {
             let current = self.head.load(Ordering::SeqCst);
@@ -72,7 +72,7 @@ impl<T> LinkedList<T> {
                     }
                 }
             } else {
-                raw_descriptor.insert(&self.head, &self.tail, boxed);
+                raw_descriptor.insert(boxed);
                 println!("Reached insert");
                 self.length.fetch_add(1, Ordering::SeqCst);
                 break;
@@ -80,8 +80,8 @@ impl<T> LinkedList<T> {
         }
     }
 
-    pub fn delete_from_tail<'a>(&'a self, raw_descriptor: &RawDescriptor<'a, T>) -> Option<T> {
-        let ret = raw_descriptor.delete(&self.head, &self.tail);
+    pub fn delete_from_tail<'a>(&self, raw_descriptor: &RawDescriptor<'a, T>) -> Option<T> {
+        let ret = raw_descriptor.delete();
         if ret.is_some() {
             println!("Reached decrement subcount");
             self.length.fetch_sub(1, Ordering::SeqCst);

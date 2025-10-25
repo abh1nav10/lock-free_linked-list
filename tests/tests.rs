@@ -7,7 +7,7 @@ mod queue_test {
     fn test_one() {
         let current = Instant::now();
         let new = &LinkedList::new();
-        let raw = &RawDescriptor::new();
+        let raw = &RawDescriptor::new(new);
         std::thread::scope(|s| {
             for i in 0..10 {
                 s.spawn(move || {
@@ -27,4 +27,3 @@ mod queue_test {
         println!("{:?}", time_taken.as_micros());
     }
 }
-

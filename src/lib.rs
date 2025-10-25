@@ -7,4 +7,4 @@ use crate::hazard::{Deleter, HazPtrObject};
 pub use crate::hazard::{DropBox, DropPointer, HazPtrHolder};
 
 use crate::descriptor::RawDescriptor;
-use crate::list::Node;
+use crate::list::{LinkedList, Node};

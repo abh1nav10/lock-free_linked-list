@@ -1,25 +1,28 @@
+#![allow(unexpected_cfgs)]
+
 #[cfg(test)]
 #[cfg(loom)]
 mod loom_tests {
     use ruby::descriptor::RawDescriptor;
     use ruby::list::LinkedList;
+    use std::sync::Arc;
     #[test]
     fn concurrency_test() {
         loom::model(|| {
-            let new = &LinkedList::new();
-            let raw_descriptor = &RawDescriptor::new();
-            std::thread::scope(|s| {
-                for i in 0..3 {
-                    s.spawn(move || {
-                        new.insert_from_head(i, &raw_descriptor);
-                    });
-                    for _ in 0..2 {
-                        s.spawn(move || {
-                            let _ = new.delete_from_tail(&raw_descriptor);
-                        });
-                    }
-                }
+            let new = Arc::new(LinkedList::new());
+            let raw_descriptor = Arc::new(RawDescriptor::new(&new));
+            let cloned1 = Arc::clone(&new);
+            let cloned2 = Arc::clone(&new);
+            let raw_cloned1 = Arc::clone(&raw_descriptor);
+            let raw_cloned2 = Arc::clone(&raw_descriptor);
+            let t1 = loom::thread::spawn(move || {
+                cloned1.insert_from_head(2, &raw_cloned1);
             });
+            let t2 = loom::thread::spawn(move || {
+                let _ = cloned2.delete_from_tail(&raw_cloned2);
+            });
+            t1.join().unwrap();
+            t2.join().unwrap();
         });
     }
 }
@@ -27,9 +30,9 @@ mod loom_tests {
 #[cfg(test)]
 #[cfg(loom)]
 mod hazard_test {
+    use loom::sync::Arc;
     use ruby::hazard::{DropBox, HazPtrHolder, HazPtrObject};
     use ruby::sync::atomic::{AtomicPtr, AtomicUsize};
-    use std::sync::Arc;
     use std::sync::atomic::Ordering;
     struct CountDrops(Arc<AtomicUsize>);
     impl Drop for CountDrops {
