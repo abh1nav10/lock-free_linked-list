@@ -404,7 +404,7 @@ impl<T> LinkedList<T> {
             let mut current_node_holder = HazPtrHolder::default();
             let mut current_node_guard = unsafe { current_node_holder.load(&self.tail) };
             if current_node_guard.is_none() {
-                println!("should not be printed for the current test case");
+                //println!("should not be printed for the current test case");
                 return None;
             }
             let mut actual_current_node_guard = current_node_guard.expect("Has to be there");
@@ -562,7 +562,7 @@ impl<T> LinkedList<T> {
     }
 
     fn loop_delete(&self, current_descriptor: *mut Descriptor<T>) {
-        println!("a");
+        //println!("a");
         let mut descriptor_holder = HazPtrHolder::default();
         let mut descriptor_guard =
             unsafe { descriptor_holder.load(&AtomicPtr::new(current_descriptor)) };
@@ -631,7 +631,7 @@ impl<T> LinkedList<T> {
                             Ordering::SeqCst,
                             Ordering::SeqCst,
                         );
-                        println!("Once every delete");
+                        //println!("Once every delete");
                         pending.store(false, Ordering::SeqCst);
                         if unsafe {
                             (*actual_tail_ptr_guard)

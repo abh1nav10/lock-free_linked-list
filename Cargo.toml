@@ -6,8 +6,14 @@ authors = ["Abhinav"]
 
 [dependencies]
 
+[dev-dependencies]
+criterion = "0.7.0"
 
 [target.'cfg(loom)'.dependencies]
 loom = "0.7"
+
+[[bench]]
+name = "benchmark"
+harness = false
 
 

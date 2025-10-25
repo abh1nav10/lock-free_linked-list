@@ -65,7 +65,7 @@ impl<T> LinkedList<T> {
                         // place otherwise the insert method has got all the capability to handle
                         // the case where head is an atomic pointer storing a null pointer.
                         self.tail.store(boxed, Ordering::SeqCst);
-                        println!("Reached insert");
+                        //println!("Reached insert");
                         self.length.fetch_add(1, Ordering::SeqCst);
                         break;
                     }
@@ -75,7 +75,7 @@ impl<T> LinkedList<T> {
                 }
             } else {
                 self.insert(boxed);
-                println!("Reached insert");
+                //println!("Reached insert");
                 self.length.fetch_add(1, Ordering::SeqCst);
                 break;
             }
@@ -85,7 +85,7 @@ impl<T> LinkedList<T> {
     pub fn delete_from_tail<'a>(&self) -> Option<T> {
         let ret = self.delete();
         if ret.is_some() {
-            println!("Reached decrement subcount");
+            //println!("Reached decrement subcount");
             self.length.fetch_sub(1, Ordering::SeqCst);
         }
         return ret;
